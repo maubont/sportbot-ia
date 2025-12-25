@@ -1,0 +1,42 @@
+# Task List - SPORTBOT IA (CO)
+
+## Phase 1: Planning & Architecture
+- [/] Define Architecture & Endpoints (Artifact A1)
+- [ ] Design Database Schema & RLS (Artifact A2)
+- [ ] Create Implementation Plan
+
+## Phase 2: Backend (Supabase & Edge Functions)
+- [ ] Create SQL Schema Script (products, variants, customers, conversations, messages, media, orders, items, payments, settings)
+- [ ] Create Seed Data Script
+- [ ] Implement `twilio_inbound_whatsapp` Function
+    - [ ] Signature validation
+    - [ ] Message parsing & persistence
+    - [ ] Media handling (inbound)
+    - [ ] AI Logic (Sales Closer System Prompt)
+    - [ ] Tool calling (search, stock, order, shipping, payment)
+- [ ] Implement `wompi_events` Function
+    - [ ] Signature/Checksum validation
+    - [ ] Payment status updates
+    - [ ] WhatsApp confirmation webhook
+- [ ] Implement `admin_actions` Function
+
+## Phase 3: Multimedia & Logic
+- [ ] Implement Media Storage logic
+- [ ] Implement PDF/Video sending logic
+- [ ] Implement Audio STT integration
+
+## Phase 4: Frontend (Admin Dashboard)
+- [ ] Initialize React + Vite + Tailwind + shadcn/ui Project
+- [ ] Setup Supabase Client & Auth
+- [ ] Implement Dashboard Layout
+- [ ] Implement Chats View (WhatsApp style)
+- [ ] Implement Orders View
+- [ ] Implement Inventory/Products View
+- [ ] Implement Settings View
+- [ ] Connect Realtime/Polling
+
+## Phase 5: Verification & Delivery
+- [ ] Create Test Scripts (Twilio & Wompi Mocking) (Artifact A5)
+- [ ] Verify End-to-End Flow
+- [ ] Create Deployment Guide (ReadMe)
+- [ ] Final Walkthrough (Artifact A6)
