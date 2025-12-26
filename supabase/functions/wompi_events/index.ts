@@ -1,5 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { createClient } from "npm:@supabase/supabase-js@2";
 
 const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
@@ -65,7 +65,7 @@ serve(async (req) => {
             return new Response(JSON.stringify({ error: "Order not found" }), { status: 404, headers: corsHeaders });
         }
 
-        const customer = (order.customers as any);
+        const customer = Array.isArray(order.customers) ? order.customers[0] : order.customers;
 
         // 4. Update Payment Record
         const { error: payError } = await supabase
@@ -82,9 +82,16 @@ serve(async (req) => {
 
         if (payError) console.error("Payment sync error:", payError);
 
-        // 5. Success Flow
+        // 5. Update Order Status
         if (status === "APPROVED" && order.status !== "paid") {
-            await supabase.from("orders").update({ status: "paid" }).eq("id", order.id);
+            const { error: updateError } = await supabase
+                .from("orders")
+                .update({ status: "paid" })
+                .eq("id", order.id);
+
+            if (updateError) {
+                console.error("Error updating order status:", updateError);
+            }
 
             // Notify Customer via WhatsApp
             const accountSid = Deno.env.get("TWILIO_ACCOUNT_SID");
@@ -94,7 +101,7 @@ serve(async (req) => {
 
             if (accountSid && authToken && toPhone) {
                 const amountFormatted = new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 }).format(order.total_cents / 100);
-                const msg = `✅ *¡Pago confirmado!* \n\nHola ${customer.name || 'cliente'}, hemos recibido tu pago de ${amountFormatted} para el pedido *#${order.id.slice(0, 8)}*. \n\nEstamos preparando tus 👟 y te avisaremos cuando estén en camino. ¡Gracias por confiar en SportBot! 🚀`;
+                const msg = `✅ *¡Pago confirmado!* \n\nHola ${customer?.name || 'cliente'}, hemos recibido tu pago de ${amountFormatted} para el pedido *#${order.id.slice(0, 8)}*. \n\nEstamos preparando tus 👟 y te avisaremos cuando estén en camino. ¡Gracias por confiar en SportBot! 🚀`;
 
                 await fetch(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`, {
                     method: "POST",
