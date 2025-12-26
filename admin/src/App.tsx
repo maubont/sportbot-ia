@@ -26,9 +26,8 @@ import Settings from "./pages/Settings";
 
 // Removed placeholder Orders function
 
-import { AuthProvider, useAuth } from "./lib/auth";
+import { AuthProvider } from "./lib/auth";
 import Login from "./pages/Login";
-import { Navigate } from "react-router-dom";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   // BYPASS: Auth is temporarily disabled for auditing

@@ -212,8 +212,8 @@ export async function getProductMedia(supabase: SupabaseClient, productId: strin
     const p = await resolveProduct(supabase, productId);
     if (!p) return { error: "Producto no encontrado" };
 
-    let q = supabase.from("product_media").select("url, type, is_primary").eq("product_id", p.id);
-    if (type) q = q.eq("type", type);
+    let q = supabase.from("product_media").select("url, media_type, is_primary").eq("product_id", p.id);
+    if (type) q = q.eq("media_type", type);
 
     const { data } = await q;
     return { media: data || [], product_name: `${p.brand} ${p.model}` };
@@ -264,6 +264,24 @@ export async function createOrder(
     if (ordErr) throw ordErr;
 
     await supabase.from("order_items").insert(orderItems.map(i => ({ ...i, order_id: order.id })));
+
+    // --- PROACTIVE STOCK RESERVATION ---
+    // Deduct stock immediately to reserve it for this potential payment.
+    // If payment fails or expires, we rely on webhooks or manual admin tools to restore it.
+    for (const item of orderItems) {
+        const { error: stockErr } = await supabase.rpc('decrement_stock', {
+            row_id: item.variant_id,
+            amount: item.qty
+        });
+
+        // Fallback if RPC doesn't exist (simpler direct update, though less atomic)
+        if (stockErr) {
+            const { data: v } = await supabase.from("product_variants").select("stock").eq("id", item.variant_id).single();
+            if (v) {
+                await supabase.from("product_variants").update({ stock: v.stock - item.qty }).eq("id", item.variant_id);
+            }
+        }
+    }
 
     const { data: settings } = await supabase.from("settings").select("*").single();
 

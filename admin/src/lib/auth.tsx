@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { type User, type Session } from "@supabase/supabase-js";
-import { supabase } from "@/lib/supabase";
+import { supabase } from "./supabase";
 
 type AuthContextType = {
     user: User | null;
@@ -18,11 +18,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
+        // Optimistic check - don't block render if failing
         supabase.auth.getSession().then(({ data: { session } }) => {
             setSession(session);
             setUser(session?.user ?? null);
             setLoading(false);
-        });
+        }).catch(() => setLoading(false));
 
         const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
             setSession(session);
@@ -35,7 +36,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     return (
         <AuthContext.Provider value={{ user, session, loading }}>
-            {!loading && children}
+            {children}
         </AuthContext.Provider>
     );
 }

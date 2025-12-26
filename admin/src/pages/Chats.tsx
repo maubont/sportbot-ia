@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabase";
-import { cn } from "@/lib/utils";
+import { supabase } from "../lib/supabase";
+import { cn } from "../lib/utils";
 import { Send } from "lucide-react";
 
 type Conversation = {
