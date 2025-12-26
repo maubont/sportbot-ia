@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { supabase } from "../lib/supabase";
 import { cn } from "../lib/utils";
 import { Send } from "lucide-react";
@@ -25,6 +25,12 @@ export default function Chats() {
     const [selectedConvo, setSelectedConvo] = useState<string | null>(null);
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState("");
+    const messagesEndRef = useRef<HTMLDivElement>(null);
+
+    // Auto-scroll to bottom when messages change
+    useEffect(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }, [messages]);
 
     useEffect(() => {
         fetchConversations();
@@ -124,6 +130,7 @@ export default function Chats() {
                                     {msg.body}
                                 </div>
                             ))}
+                            <div ref={messagesEndRef} />
                         </div>
                         <div className="p-4 border-t border-border flex gap-2">
                             <input

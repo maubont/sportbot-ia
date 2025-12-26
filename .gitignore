@@ -27,3 +27,11 @@ coverage/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Development artifacts (debug scripts, temp files)
+debug_*.ts
+debug_*.sql
+verify_*.ts
+*.resolved
+*.resolved.*
+*.metadata.json

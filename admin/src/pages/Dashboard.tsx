@@ -58,7 +58,7 @@ export default function Dashboard() {
             ] = await Promise.all([
                 supabase.from('customers').select('*', { count: 'exact', head: true }),
                 supabase.from('orders').select('*', { count: 'exact', head: true }),
-                supabase.from('orders').select('total_cents').eq('status', 'paid'),
+                supabase.from('orders').select('total_cents').in('status', ['paid', 'shipped']),
                 supabase.from('conversations').select('*', { count: 'exact', head: true }).eq('status', 'open'),
                 supabase.from('product_variants').select('id, stock, size, products(brand, model)'),
                 supabase.from("orders").select('id, order_items ( variant_id, qty )').in('status', ['paid', 'processing'])

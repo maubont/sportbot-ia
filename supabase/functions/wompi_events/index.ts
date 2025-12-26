@@ -116,6 +116,23 @@ serve(async (req) => {
                     },
                     body: new URLSearchParams({ From: fromPhone, To: toPhone, Body: msg })
                 });
+
+                // Log message in conversation history (for Admin Panel)
+                const { data: conversation } = await supabase
+                    .from("conversations")
+                    .select("id")
+                    .eq("customer_id", order.customer_id)
+                    .limit(1)
+                    .single();
+
+                if (conversation) {
+                    await supabase.from("messages").insert({
+                        conversation_id: conversation.id,
+                        role: 'assistant',
+                        direction: 'outbound',
+                        body: msg
+                    });
+                }
             }
         }
         else if ((status === "DECLINED" || status === "VOIDED" || status === "ERROR") && order.status !== "cancelled") {
