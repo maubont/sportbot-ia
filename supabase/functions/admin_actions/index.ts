@@ -80,6 +80,33 @@ serve(async (req) => {
 
             console.log("WhatsApp sent successfully via send_whatsapp:", result.sid);
 
+            // Log to conversation history (find customer by phone)
+            const { data: customer } = await supabase
+                .from("customers")
+                .select("id")
+                .eq("phone_e164", phone)
+                .single();
+
+            if (customer) {
+                const { data: conversation } = await supabase
+                    .from("conversations")
+                    .select("id")
+                    .eq("customer_id", customer.id)
+                    .limit(1)
+                    .single();
+
+                if (conversation) {
+                    await supabase.from("messages").insert({
+                        conversation_id: conversation.id,
+                        role: 'assistant',
+                        direction: 'outbound',
+                        body: message,
+                        twilio_message_sid: result.sid
+                    });
+                    console.log("Message logged to conversation history");
+                }
+            }
+
             return new Response(JSON.stringify({ success: true, sid: result.sid }), {
                 headers: { ...corsHeaders, "Content-Type": "application/json" },
                 status: 200,

@@ -19,7 +19,6 @@ serve(async (req) => {
     if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
     try {
-        const timestamp = req.headers.get("x-event-timestamp");
         const checksum = req.headers.get("x-event-checksum");
 
         const body = await req.json();
@@ -27,11 +26,14 @@ serve(async (req) => {
 
         console.log(`[Wompi] Event: ${event} (Ref: ${data.transaction?.reference})`);
 
-        // 1. Verify Authentication (per Wompi docs: https://docs.wompi.co)
+        // 1. Verify Authentication (per Wompi docs: https://docs.wompi.co/docs/colombia/eventos/)
+        // Uses body.timestamp (NOT header x-event-timestamp)
         const eventSecret = Deno.env.get("WOMPI_EVENT_SECRET");
         const signature = body.signature;
+        const bodyTimestamp = body.timestamp; // CRITICAL: timestamp comes from body, not header
 
-        if (eventSecret && checksum && signature?.properties) {
+        if (eventSecret && checksum && signature?.properties && bodyTimestamp) {
+            // Build chain from signature.properties
             let chain = "";
             for (const prop of signature.properties) {
                 const parts = prop.split(".");
@@ -41,7 +43,8 @@ serve(async (req) => {
                 }
                 chain += String(value ?? "");
             }
-            chain += timestamp + eventSecret;
+            // Add body timestamp and secret
+            chain += bodyTimestamp + eventSecret;
 
             const myChecksum = await sha256Hex(chain);
 
@@ -49,7 +52,8 @@ serve(async (req) => {
                 console.error("CHECKSUM MISMATCH - Rejecting request", {
                     received: checksum,
                     calculated: myChecksum,
-                    properties: signature.properties
+                    properties: signature.properties,
+                    bodyTimestamp
                 });
                 return new Response(JSON.stringify({ error: "Invalid integrity" }), { status: 401, headers: corsHeaders });
             }
@@ -57,7 +61,7 @@ serve(async (req) => {
         } else if (eventSecret && checksum && !signature?.properties) {
             console.warn("[Wompi] Event missing signature.properties - skipping validation");
         } else {
-            console.warn("[Wompi] Skipping Checksum validation (secret not set or no checksum)");
+            console.warn("[Wompi] Skipping Checksum validation (missing: secret, checksum, or timestamp)");
         }
 
         if (event !== "transaction.updated") {
