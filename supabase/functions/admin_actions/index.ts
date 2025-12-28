@@ -78,6 +78,50 @@ serve(async (req) => {
             });
         }
 
+        // Direct WhatsApp send (used by Orders page for delivery notifications)
+        if (action === "send_whatsapp") {
+            const { phone, message } = payload;
+
+            if (!phone || !message) {
+                throw new Error("phone and message are required for send_whatsapp");
+            }
+
+            const accountSid = Deno.env.get("TWILIO_ACCOUNT_SID");
+            const authToken = Deno.env.get("TWILIO_AUTH_TOKEN");
+            const fromNumber = Deno.env.get("TWILIO_WHATSAPP_FROM") || "whatsapp:+14155238886";
+
+            const body = new URLSearchParams();
+            body.append("From", fromNumber);
+            body.append("To", phone);
+            body.append("Body", message);
+
+            const twilioResp = await fetch(
+                `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
+                {
+                    method: "POST",
+                    headers: {
+                        "Authorization": "Basic " + btoa(accountSid + ":" + authToken),
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                    body: body,
+                }
+            );
+
+            if (!twilioResp.ok) {
+                const errText = await twilioResp.text();
+                console.error("Twilio send_whatsapp error:", errText);
+                throw new Error("Twilio Error: " + errText);
+            }
+
+            const twilioData = await twilioResp.json();
+            console.log("WhatsApp sent successfully via send_whatsapp:", twilioData.sid);
+
+            return new Response(JSON.stringify({ success: true, sid: twilioData.sid }), {
+                headers: { ...corsHeaders, "Content-Type": "application/json" },
+                status: 200,
+            });
+        }
+
         return new Response("Action not supported", { status: 400, headers: corsHeaders });
 
     } catch (error) {

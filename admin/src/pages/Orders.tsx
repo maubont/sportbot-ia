@@ -134,11 +134,50 @@ export default function Orders() {
         });
     }
 
+    async function handleDelivered() {
+        if (!selectedOrder) return;
+
+        // OPTIMISTIC UI PATTERN
+        const updates = {
+            status: 'delivered',
+            delivered_at: new Date().toISOString()
+        };
+
+        // Instant UI feedback
+        setOrders(orders.map(o => o.id === selectedOrder.id ? { ...o, ...updates } : o));
+        setSelectedOrder({ ...selectedOrder, ...updates });
+
+        // Background: Update database
+        supabase.from("orders")
+            .update(updates)
+            .eq("id", selectedOrder.id)
+            .then(({ error }) => {
+                if (error) {
+                    console.error("Error updating order to delivered:", error);
+                } else {
+                    console.log("Order marked as delivered successfully");
+                }
+            });
+
+        // Background: Send WhatsApp notification
+        const customerPhone = selectedOrder.customers?.phone_e164;
+        if (customerPhone) {
+            const msg = `✅ *¡Pedido entregado!*\n\nHola ${selectedOrder.customers?.name || 'Cliente'}, tu pedido ha sido entregado exitosamente.\n\n¡Gracias por tu compra en SportBot! 🎉\n\n¿Todo llegó bien? Si tienes alguna pregunta, estamos aquí para ayudarte. 👟`;
+
+            supabase.functions.invoke('admin_actions', {
+                body: { action: 'send_whatsapp', payload: { phone: customerPhone, message: msg } }
+            }).catch(err => console.error("WhatsApp notification error:", err));
+        }
+    }
+
     const getStatusColor = (status: string) => {
         switch (status) {
             case "paid": return "text-green-600 bg-green-100";
             case "shipped": return "text-blue-600 bg-blue-100";
+            case "delivered": return "text-emerald-700 bg-emerald-100";
             case "pending_payment": return "text-yellow-600 bg-yellow-100";
+            case "awaiting_payment": return "text-yellow-600 bg-yellow-100";
+            case "expired": return "text-orange-600 bg-orange-100";
             case "cancelled": return "text-red-600 bg-red-100";
             default: return "text-gray-600 bg-gray-100";
         }
@@ -236,6 +275,36 @@ export default function Orders() {
                                         <Truck className="w-4 h-4" />
                                         Dispatch Order
                                     </button>
+                                </div>
+                            )}
+
+                            {/* Mark as Delivered Bar */}
+                            {selectedOrder.status === 'shipped' && (
+                                <div className="bg-emerald-50 dark:bg-emerald-900/20 p-4 rounded-lg flex justify-between items-center border border-emerald-100 dark:border-emerald-900/30">
+                                    <div>
+                                        <h4 className="font-semibold text-emerald-900 dark:text-emerald-300">In Transit</h4>
+                                        <p className="text-sm text-emerald-700 dark:text-emerald-400">
+                                            Tracking: {selectedOrder.tracking_number} ({selectedOrder.carrier_name})
+                                        </p>
+                                    </div>
+                                    <button
+                                        onClick={handleDelivered}
+                                        className="bg-emerald-600 text-white px-4 py-2 rounded-md hover:bg-emerald-700 flex items-center gap-2"
+                                    >
+                                        ✓ Mark as Delivered
+                                    </button>
+                                </div>
+                            )}
+
+                            {/* Delivered Success Banner */}
+                            {selectedOrder.status === 'delivered' && (
+                                <div className="bg-emerald-100 dark:bg-emerald-900/30 p-4 rounded-lg border border-emerald-200 dark:border-emerald-800">
+                                    <h4 className="font-semibold text-emerald-800 dark:text-emerald-300 flex items-center gap-2">
+                                        ✓ Order Delivered
+                                    </h4>
+                                    <p className="text-sm text-emerald-700 dark:text-emerald-400">
+                                        This order has been completed successfully.
+                                    </p>
                                 </div>
                             )}
 

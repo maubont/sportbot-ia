@@ -26,21 +26,43 @@ serve(async (req) => {
 
         console.log(`[Wompi] Event: ${event} (Ref: ${data.transaction?.reference})`);
 
-        // 1. Verify Authentication
+        // 1. Verify Authentication (per Wompi docs: https://docs.wompi.co)
+        // The signature.properties array tells us which fields to concatenate
         const eventSecret = Deno.env.get("WOMPI_EVENT_SECRET");
-        if (eventSecret && checksum) {
-            const t = data.transaction;
-            // Standard Wompi Chain: id + status + amount_in_cents + timestamp + secret
-            const chain = `${t.id}${t.status}${t.amount_in_cents}${timestamp}${eventSecret}`;
+        const signature = body.signature;
+
+        if (eventSecret && checksum && signature?.properties) {
+            // Build chain dynamically from signature.properties
+            // e.g. ["transaction.id", "transaction.status", "transaction.amount_in_cents"]
+            let chain = "";
+            for (const prop of signature.properties) {
+                // Navigate nested properties like "transaction.id"
+                const parts = prop.split(".");
+                let value: any = data;
+                for (const part of parts) {
+                    value = value?.[part];
+                }
+                chain += String(value ?? "");
+            }
+            // Add timestamp and secret
+            chain += timestamp + eventSecret;
+
             const myChecksum = await sha256Hex(chain);
 
             if (checksum.toLowerCase() !== myChecksum.toLowerCase()) {
-                console.error("CHECKSUM MISMATCH WARNING", { received: checksum, calculated: myChecksum, chain });
-                // FOR NOW: Don't return 401, just warn. This ensures we process the payment while debugging integrity.
-                // return new Response(JSON.stringify({ error: "Invalid integrity" }), { status: 401, headers: corsHeaders });
+                console.error("CHECKSUM MISMATCH - Rejecting request", {
+                    received: checksum,
+                    calculated: myChecksum,
+                    properties: signature.properties
+                });
+                return new Response(JSON.stringify({ error: "Invalid integrity" }), { status: 401, headers: corsHeaders });
             }
+            console.log("[Wompi] ✓ Checksum validated successfully");
+        } else if (eventSecret && checksum && !signature?.properties) {
+            // Fallback: old events without signature.properties (shouldn't happen)
+            console.warn("[Wompi] Event missing signature.properties - skipping validation");
         } else {
-            console.warn("Skipping Checksum validation (WOMPI_EVENT_SECRET not set)");
+            console.warn("[Wompi] Skipping Checksum validation (secret not set or no checksum)");
         }
 
         if (event !== "transaction.updated") {
