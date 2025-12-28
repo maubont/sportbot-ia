@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { sendWhatsApp } from "../_shared/twilio.ts";
 
 const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
@@ -37,7 +38,6 @@ serve(async (req) => {
         if (orderError || !order) throw new Error("Order not found");
 
         // 2. PRIMARY ACTION: Update Order Status
-        // This MUST succeed for the business process to continue.
         const { error: updateError } = await supabase
             .from('orders')
             .update({
@@ -58,80 +58,44 @@ serve(async (req) => {
         const phone = order.customers?.phone_e164;
 
         if (phone) {
-            try {
-                const messageBody = `📦 *¡Tu paquete va en camino!*\n\nHola ${customerName}, tu orden ha sido despachada con la transportadora *${carrier_name}*.\n\n📝 *Número de Guía:* ${tracking_number}\n\nPuedes rastrear tu envío en la página oficial de ${carrier_name}.\n\n¡Gracias por tu compra! 👟`;
+            const messageBody = `📦 *¡Tu paquete va en camino!*\n\nHola ${customerName}, tu orden ha sido despachada con la transportadora *${carrier_name}*.\n\n📝 *Número de Guía:* ${tracking_number}\n\nPuedes rastrear tu envío en la página oficial de ${carrier_name}.\n\n¡Gracias por tu compra! 👟`;
 
-                const accountSid = Deno.env.get('TWILIO_ACCOUNT_SID')!;
-                const authToken = Deno.env.get('TWILIO_AUTH_TOKEN')!;
-                const fromNumber = Deno.env.get('TWILIO_WHATSAPP_FROM')!;
+            console.log(`Sending WhatsApp to ${phone}...`);
 
-                const body = new URLSearchParams({
-                    To: phone,
-                    From: fromNumber,
-                    Body: messageBody
-                });
+            // Use shared Twilio helper
+            const result = await sendWhatsApp({
+                to: phone,
+                body: messageBody
+            });
 
-                console.log(`Sending WhatsApp to ${phone}...`);
-
-                // TIMEOUT ENFORCEMENT: 5 seconds max
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-                try {
-                    const twilioRes = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`, {
-                        method: 'POST',
-                        headers: {
-                            'Authorization': `Basic ${btoa(accountSid + ":" + authToken)}`,
-                            'Content-Type': 'application/x-www-form-urlencoded'
-                        },
-                        body: body,
-                        signal: controller.signal
-                    });
-                    clearTimeout(timeoutId);
-
-                    // Safe JSON parsing
-                    let twilioData;
-                    try {
-                        twilioData = await twilioRes.json();
-                    } catch (e) {
-                        twilioData = { detail: "Invalid JSON response from Twilio" };
-                    }
-
-                    if (!twilioRes.ok) {
-                        const twilioMsg = twilioData.message || twilioData.detail || "Unknown Twilio Error";
-                        console.error("Twilio Warning:", twilioMsg);
-                        notificationStatus = "failed";
-                        notificationError = twilioMsg;
-                    } else {
-                        // 4. Log in History
-                        let { data: conversation } = await supabase.from("conversations").select("id").eq("customer_id", order.customers.id).limit(1).single();
-                        if (conversation) {
-                            await supabase.from("messages").insert({
-                                conversation_id: conversation.id,
-                                role: 'assistant',
-                                direction: 'outbound',
-                                body: messageBody
-                            });
-                        }
-                    }
-                } catch (fetchErr: any) {
-                    clearTimeout(timeoutId);
-                    if (fetchErr.name === 'AbortError') {
-                        throw new Error("Twilio Fetch Timeout");
-                    }
-                    throw fetchErr;
-                }
-
-            } catch (msgErr: any) {
-                console.error("Notification System Error:", msgErr);
+            if (!result.success) {
+                console.error("Twilio Warning:", result.error);
                 notificationStatus = "failed";
-                notificationError = msgErr.message;
+                notificationError = result.error;
+            } else {
+                // Log in conversation history
+                const { data: conversation } = await supabase
+                    .from("conversations")
+                    .select("id")
+                    .eq("customer_id", order.customers.id)
+                    .limit(1)
+                    .single();
+
+                if (conversation) {
+                    await supabase.from("messages").insert({
+                        conversation_id: conversation.id,
+                        role: 'assistant',
+                        direction: 'outbound',
+                        body: messageBody,
+                        twilio_message_sid: result.sid
+                    });
+                }
             }
         } else {
             notificationStatus = "skipped_no_phone";
         }
 
-        // Return Success (200) but include Notification Status
+        // Return Success with Notification Status
         return new Response(JSON.stringify({
             success: true,
             message: "Order marked as dispatched.",

@@ -73,21 +73,20 @@ export default function Chats() {
         setMessages([...messages, tempMsg]);
         setInput("");
 
-        // Send to Admin Actions Function (to trigger WhatsApp)
-        // For now, just insert to DB if we don't have the function URL configured
-        // But ideally we call the function. 
-        // Let's toggle between direct DB insert (internal note) vs sending.
-        // Assuming "Send" means send to user.
-
-        // We will use direct DB insert for now to simulate, 
-        // but in production this should call `admin_actions` edge function.
-
-        await supabase.from("messages").insert({
-            conversation_id: selectedConvo,
-            role: "assistant",
-            direction: "outbound",
-            body: tempMsg.body
+        // Call admin_actions Edge Function to send WhatsApp and log to DB
+        const { error } = await supabase.functions.invoke('admin_actions', {
+            body: {
+                action: 'send_message',
+                payload: {
+                    conversation_id: selectedConvo,
+                    content: tempMsg.body
+                }
+            }
         });
+
+        if (error) {
+            console.error("Error sending message:", error);
+        }
     }
 
     return (

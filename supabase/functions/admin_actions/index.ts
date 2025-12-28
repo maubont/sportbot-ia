@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { sendWhatsApp } from "../_shared/twilio.ts";
 
 const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
@@ -17,6 +18,7 @@ serve(async (req) => {
         const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
         const supabase = createClient(supabaseUrl, supabaseKey);
 
+        // Action: Send message from admin chat
         if (action === "send_message") {
             const { conversation_id, content, media_url } = payload;
 
@@ -32,35 +34,16 @@ serve(async (req) => {
             const customer = conversation.customers as any;
             const toPhone = customer?.phone_e164;
 
-            // 2. Send via Twilio API
-            const accountSid = Deno.env.get("TWILIO_ACCOUNT_SID");
-            const authToken = Deno.env.get("TWILIO_AUTH_TOKEN");
-            const fromNumber = Deno.env.get("TWILIO_WHATSAPP_FROM") || "whatsapp:+14155238886";
+            // 2. Send via shared Twilio helper
+            const result = await sendWhatsApp({
+                to: toPhone,
+                body: content || "",
+                mediaUrls: media_url ? [media_url] : []
+            });
 
-            const body = new URLSearchParams();
-            body.append("From", fromNumber);
-            body.append("To", toPhone);
-            if (content) body.append("Body", content);
-            if (media_url) body.append("MediaUrl", media_url);
-
-            const twilioResp = await fetch(
-                `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
-                {
-                    method: "POST",
-                    headers: {
-                        "Authorization": "Basic " + btoa(accountSid + ":" + authToken),
-                        "Content-Type": "application/x-www-form-urlencoded",
-                    },
-                    body: body,
-                }
-            );
-
-            if (!twilioResp.ok) {
-                const errText = await twilioResp.text();
-                throw new Error("Twilio Error: " + errText);
+            if (!result.success) {
+                throw new Error("Twilio Error: " + result.error);
             }
-
-            const twilioData = await twilioResp.json();
 
             // 3. Log to DB
             await supabase.from("messages").insert({
@@ -68,17 +51,16 @@ serve(async (req) => {
                 direction: "outbound",
                 role: "assistant",
                 body: content,
-                twilio_message_sid: twilioData.sid
+                twilio_message_sid: result.sid
             });
 
-
-            return new Response(JSON.stringify({ success: true, sid: twilioData.sid }), {
+            return new Response(JSON.stringify({ success: true, sid: result.sid }), {
                 headers: { ...corsHeaders, "Content-Type": "application/json" },
                 status: 200,
             });
         }
 
-        // Direct WhatsApp send (used by Orders page for delivery notifications)
+        // Action: Direct WhatsApp send (for delivery notifications, etc.)
         if (action === "send_whatsapp") {
             const { phone, message } = payload;
 
@@ -86,37 +68,19 @@ serve(async (req) => {
                 throw new Error("phone and message are required for send_whatsapp");
             }
 
-            const accountSid = Deno.env.get("TWILIO_ACCOUNT_SID");
-            const authToken = Deno.env.get("TWILIO_AUTH_TOKEN");
-            const fromNumber = Deno.env.get("TWILIO_WHATSAPP_FROM") || "whatsapp:+14155238886";
+            const result = await sendWhatsApp({
+                to: phone,
+                body: message
+            });
 
-            const body = new URLSearchParams();
-            body.append("From", fromNumber);
-            body.append("To", phone);
-            body.append("Body", message);
-
-            const twilioResp = await fetch(
-                `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
-                {
-                    method: "POST",
-                    headers: {
-                        "Authorization": "Basic " + btoa(accountSid + ":" + authToken),
-                        "Content-Type": "application/x-www-form-urlencoded",
-                    },
-                    body: body,
-                }
-            );
-
-            if (!twilioResp.ok) {
-                const errText = await twilioResp.text();
-                console.error("Twilio send_whatsapp error:", errText);
-                throw new Error("Twilio Error: " + errText);
+            if (!result.success) {
+                console.error("Twilio send_whatsapp error:", result.error);
+                throw new Error("Twilio Error: " + result.error);
             }
 
-            const twilioData = await twilioResp.json();
-            console.log("WhatsApp sent successfully via send_whatsapp:", twilioData.sid);
+            console.log("WhatsApp sent successfully via send_whatsapp:", result.sid);
 
-            return new Response(JSON.stringify({ success: true, sid: twilioData.sid }), {
+            return new Response(JSON.stringify({ success: true, sid: result.sid }), {
                 headers: { ...corsHeaders, "Content-Type": "application/json" },
                 status: 200,
             });

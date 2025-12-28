@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { sendWhatsApp } from "../_shared/twilio.ts";
 
 const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
@@ -27,16 +28,12 @@ serve(async (req) => {
         console.log(`[Wompi] Event: ${event} (Ref: ${data.transaction?.reference})`);
 
         // 1. Verify Authentication (per Wompi docs: https://docs.wompi.co)
-        // The signature.properties array tells us which fields to concatenate
         const eventSecret = Deno.env.get("WOMPI_EVENT_SECRET");
         const signature = body.signature;
 
         if (eventSecret && checksum && signature?.properties) {
-            // Build chain dynamically from signature.properties
-            // e.g. ["transaction.id", "transaction.status", "transaction.amount_in_cents"]
             let chain = "";
             for (const prop of signature.properties) {
-                // Navigate nested properties like "transaction.id"
                 const parts = prop.split(".");
                 let value: any = data;
                 for (const part of parts) {
@@ -44,7 +41,6 @@ serve(async (req) => {
                 }
                 chain += String(value ?? "");
             }
-            // Add timestamp and secret
             chain += timestamp + eventSecret;
 
             const myChecksum = await sha256Hex(chain);
@@ -59,7 +55,6 @@ serve(async (req) => {
             }
             console.log("[Wompi] ✓ Checksum validated successfully");
         } else if (eventSecret && checksum && !signature?.properties) {
-            // Fallback: old events without signature.properties (shouldn't happen)
             console.warn("[Wompi] Event missing signature.properties - skipping validation");
         } else {
             console.warn("[Wompi] Skipping Checksum validation (secret not set or no checksum)");
@@ -76,7 +71,7 @@ serve(async (req) => {
 
         const tx = data.transaction;
         const ref = tx.reference;
-        const status = tx.status; // APPROVED, DECLINED, VOIDED, ERROR
+        const status = tx.status;
 
         // 3. Find Order & Customer
         const { data: order, error: orderError } = await supabase
@@ -109,7 +104,6 @@ serve(async (req) => {
 
         // 5. Update Order Status
         if (status === "APPROVED" && order.status !== "paid") {
-            // Update Order
             const { error: updateError } = await supabase
                 .from("orders")
                 .update({ status: "paid" })
@@ -118,53 +112,44 @@ serve(async (req) => {
             if (updateError) {
                 console.error("Error updating order status:", updateError);
             }
-            // Note: Stock is NOT deducted here anymore. It was deducted at creation time (Reserve First).
 
-            // Notify Customer via WhatsApp
-            const accountSid = Deno.env.get("TWILIO_ACCOUNT_SID");
-            const authToken = Deno.env.get("TWILIO_AUTH_TOKEN");
-            const fromPhone = Deno.env.get("TWILIO_WHATSAPP_FROM") || "whatsapp:+14155238886";
+            // Notify Customer via WhatsApp using shared helper
             const toPhone = customer?.phone_e164;
-
-            if (accountSid && authToken && toPhone) {
+            if (toPhone) {
                 const amountFormatted = new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 }).format(order.total_cents / 100);
                 const msg = `✅ *¡Pago confirmado!* \n\nHola ${customer?.name || 'cliente'}, hemos recibido tu pago de ${amountFormatted} para el pedido *#${order.id.slice(0, 8)}*. \n\nEstamos preparando tus 👟 y te avisaremos cuando estén en camino. ¡Gracias por confiar en SportBot! 🚀`;
 
-                await fetch(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`, {
-                    method: "POST",
-                    headers: {
-                        "Authorization": "Basic " + btoa(`${accountSid}:${authToken}`),
-                        "Content-Type": "application/x-www-form-urlencoded"
-                    },
-                    body: new URLSearchParams({ From: fromPhone, To: toPhone, Body: msg })
-                });
+                const result = await sendWhatsApp({ to: toPhone, body: msg });
 
-                // Log message in conversation history (for Admin Panel)
-                const { data: conversation } = await supabase
-                    .from("conversations")
-                    .select("id")
-                    .eq("customer_id", order.customer_id)
-                    .limit(1)
-                    .single();
+                if (result.success) {
+                    // Log message in conversation history
+                    const { data: conversation } = await supabase
+                        .from("conversations")
+                        .select("id")
+                        .eq("customer_id", order.customer_id)
+                        .limit(1)
+                        .single();
 
-                if (conversation) {
-                    await supabase.from("messages").insert({
-                        conversation_id: conversation.id,
-                        role: 'assistant',
-                        direction: 'outbound',
-                        body: msg
-                    });
+                    if (conversation) {
+                        await supabase.from("messages").insert({
+                            conversation_id: conversation.id,
+                            role: 'assistant',
+                            direction: 'outbound',
+                            body: msg,
+                            twilio_message_sid: result.sid
+                        });
+                    }
+                } else {
+                    console.error("[Wompi] WhatsApp notification failed:", result.error);
                 }
             }
         }
         else if ((status === "DECLINED" || status === "VOIDED" || status === "ERROR") && order.status !== "cancelled") {
-            // --- RESTOCK LOGIC ---
-            // If payment failed, we MUST release the reservation (add stock back).
             console.log(`[Wompi] Payment Failed (${status}). Restocking Order ${order.id}`);
 
             const { error: updateError } = await supabase
                 .from("orders")
-                .update({ status: "cancelled" }) // Mark as cancelled so we don't restock twice
+                .update({ status: "cancelled" })
                 .eq("id", order.id);
 
             if (!updateError) {
@@ -175,13 +160,11 @@ serve(async (req) => {
 
                 if (items) {
                     for (const item of items) {
-                        // Add stock back
                         const { error: stockErr } = await supabase.rpc('increment_stock', {
                             row_id: item.variant_id,
                             amount: item.qty
                         });
 
-                        // Fallback
                         if (stockErr) {
                             const { data: v } = await supabase.from("product_variants").select("stock").eq("id", item.variant_id).single();
                             if (v) {
@@ -206,4 +189,3 @@ serve(async (req) => {
         });
     }
 });
-
