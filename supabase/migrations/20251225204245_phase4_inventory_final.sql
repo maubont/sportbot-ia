@@ -20,12 +20,22 @@ CREATE POLICY "Admin Full Access Product Media" ON product_media FOR ALL USING (
 
 
 -- 2. Storage Bucket Configuration
-INSERT INTO storage.buckets (id, name, public)
-VALUES ('product-media', 'product-media', true)
-ON CONFLICT (id) DO UPDATE SET public = true;
+-- Ver nota en 20251221_phase3_media.sql: `storage` no existe en local al migrar.
+DO $storage$
+BEGIN
+    IF to_regclass('storage.buckets') IS NULL THEN
+        RAISE NOTICE 'storage no disponible: se omiten buckets/politicas de storage';
+        RETURN;
+    END IF;
 
-CREATE POLICY "Public View Product Media Bucket" ON storage.objects FOR SELECT USING (bucket_id = 'product-media');
-CREATE POLICY "Admin Manage Product Media Bucket" ON storage.objects FOR ALL USING (bucket_id = 'product-media');
+    INSERT INTO storage.buckets (id, name, public)
+    VALUES ('product-media', 'product-media', true)
+    ON CONFLICT (id) DO UPDATE SET public = true;
+
+    CREATE POLICY "Public View Product Media Bucket" ON storage.objects FOR SELECT USING (bucket_id = 'product-media');
+    CREATE POLICY "Admin Manage Product Media Bucket" ON storage.objects FOR ALL USING (bucket_id = 'product-media');
+END
+$storage$;
 
 
 -- 3. Atomic Inventory Control (RPC Functions)

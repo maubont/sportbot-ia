@@ -1,0 +1,1 @@
+# Configure synthetic test recipients locally; never commit real numbers.

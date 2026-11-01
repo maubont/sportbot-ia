@@ -1,5 +1,18 @@
-import { BrowserRouter, Routes, Route, Outlet } from "react-router-dom";
+import { type ReactNode } from "react";
+import { BrowserRouter, Routes, Route, Outlet, Navigate, useLocation } from "react-router-dom";
 import { Sidebar } from "./components/Sidebar";
+import { AuthProvider } from "./lib/auth";
+import { useAuth } from "./lib/auth-context";
+import AiOps from "./pages/AiOps";
+import Dashboard from "./pages/Dashboard";
+import Inbox from "./pages/Inbox";
+import Inventory from "./pages/Inventory";
+import Login from "./pages/Login";
+import Logistics from "./pages/Logistics";
+import Orders from "./pages/Orders";
+import Payments from "./pages/Payments";
+import SetPassword from "./pages/SetPassword";
+import Settings from "./pages/Settings";
 
 function Layout() {
   return (
@@ -12,28 +25,26 @@ function Layout() {
   );
 }
 
-import Chats from "./pages/Chats";
+function ProtectedRoute({ children }: { children: ReactNode }) {
+  const { user, loading } = useAuth();
+  const location = useLocation();
+  const isLocalReviewRoute = import.meta.env.DEV && location.pathname === "/inbox-review";
 
-import Dashboard from "./pages/Dashboard";
+  if (isLocalReviewRoute) {
+    return <>{children}</>;
+  }
 
-// Removed placeholder Chats function
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background text-sm text-muted-foreground">
+        Validando sesión...
+      </div>
+    );
+  }
 
-
-import Orders from "./pages/Orders";
-
-import Inventory from "./pages/Inventory";
-import Settings from "./pages/Settings";
-
-// Removed placeholder Orders function
-
-import { AuthProvider } from "./lib/auth";
-import Login from "./pages/Login";
-
-function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  // BYPASS: Auth is temporarily disabled for auditing
-  // const { user, loading } = useAuth();
-  // if (loading) return <div>Loading...</div>;
-  // if (!user) return <Navigate to="/login" />;
+  if (!user) {
+    return <Navigate to="/login" replace state={{ from: location }} />;
+  }
 
   return <>{children}</>;
 }
@@ -44,10 +55,17 @@ function App() {
       <BrowserRouter>
         <Routes>
           <Route path="/login" element={<Login />} />
+          <Route path="/set-password" element={<SetPassword />} />
           <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
             <Route path="/" element={<Dashboard />} />
-            <Route path="/chats" element={<Chats />} />
+            <Route path="/inbox" element={<Inbox />} />
+            <Route path="/inbox-review" element={<Inbox reviewFixture />} />
+            {/* Legacy URL now lands in the single operator workstation. */}
+            <Route path="/chats" element={<Navigate to="/inbox" replace />} />
+            <Route path="/ai-ops" element={<AiOps />} />
             <Route path="/orders" element={<Orders />} />
+            <Route path="/payments" element={<Payments />} />
+            <Route path="/logistics" element={<Logistics />} />
             <Route path="/inventory" element={<Inventory />} />
             <Route path="/settings" element={<Settings />} />
           </Route>

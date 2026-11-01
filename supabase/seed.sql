@@ -112,13 +112,32 @@ SELECT id, 43, 3 FROM products WHERE sku = 'NK-JOR-010' ON CONFLICT DO NOTHING;
 
 -- Add a customer for testing
 INSERT INTO customers (phone_e164, name, city) VALUES
-('whatsapp:+573001234567', 'Usuario Test', 'Bogotá')
+('whatsapp:+12025550102', 'Usuario Test', 'Bogotá')
 ON CONFLICT DO NOTHING;
 
 -- Product Media (Fixed URLs for reliable delivery)
-INSERT INTO product_media (product_id, type, url, is_primary)
-SELECT id, 'image', 'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c3/Python-logo-notext.svg/1200px-Python-logo-notext.svg.png', true FROM products WHERE model ILIKE '%1 Low%'; -- Jordan 1 Low
+INSERT INTO product_media (product_id, media_type, url, storage_path, is_primary)
+SELECT id, 'image', 'https://images.unsplash.com/photo-1549298916-b41d501d3772?auto=format&fit=crop&w=900&q=80', 'seed/jordan-1-low/red-black-sneaker.jpg', true FROM products WHERE model ILIKE '%1 Low%'; -- Jordan 1 Low
 
-INSERT INTO product_media (product_id, type, url, is_primary)
-SELECT id, 'image', 'https://upload.wikimedia.org/wikipedia/commons/thumb/2/23/Nike_Air_Max_90_Infrared_%284805905007%29.jpg/640px-Nike_Air_Max_90_Infrared_%284805905007%29.jpg', true FROM products WHERE model ILIKE '%Air Max 90%'; -- Air Max 90
+INSERT INTO product_media (product_id, media_type, url, storage_path, is_primary)
+SELECT id, 'image', 'https://upload.wikimedia.org/wikipedia/commons/thumb/2/23/Nike_Air_Max_90_Infrared_%284805905007%29.jpg/640px-Nike_Air_Max_90_Infrared_%284805905007%29.jpg', 'seed/air-max-90/infrared.jpg', true FROM products WHERE model ILIKE '%Air Max 90%'; -- Air Max 90
+
+-- Colores canónicos por SKU (ver 20261026120000_product_colors.sql y
+-- frontend/src/lib/colors.ts). Se derivan del colorway con una regla explícita:
+-- se listan los colores visibles dominantes, no el nombre comercial.
+UPDATE products AS p
+SET colors = v.colors
+FROM (VALUES
+    ('NK-AIR-001', ARRAY['blanco', 'gris', 'rojo']::text[]),
+    ('NK-PEG-002', ARRAY['negro', 'blanco']::text[]),
+    ('AD-ULT-003', ARRAY['negro']::text[]),
+    ('AD-FOR-004', ARRAY['blanco', 'azul']::text[]),
+    ('NK-DUN-005', ARRAY['blanco', 'negro']::text[]),
+    ('NK-MET-006', ARRAY['gris', 'verde']::text[]),
+    ('NB-550-007', ARRAY['blanco', 'verde']::text[]),
+    ('PU-VEL-008', ARRAY['plata', 'gris']::text[]),
+    ('UA-CUR-009', ARRAY['azul', 'amarillo']::text[]),
+    ('NK-JOR-010', ARRAY['negro', 'rojo']::text[])
+) AS v(sku, colors)
+WHERE p.sku = v.sku;
 

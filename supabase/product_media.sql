@@ -2,8 +2,9 @@
 CREATE TABLE IF NOT EXISTS product_media (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     product_id UUID REFERENCES products(id) ON DELETE CASCADE,
-    type VARCHAR(20) NOT NULL CHECK (type IN ('image', 'pdf', 'video')),
+    media_type TEXT NOT NULL DEFAULT 'image' CHECK (media_type IN ('image', 'pdf', 'video')),
     url TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
     is_primary BOOLEAN DEFAULT false,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );

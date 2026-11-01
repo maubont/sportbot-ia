@@ -1,230 +1,685 @@
-import { useEffect, useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { supabase } from './lib/supabase';
+import { useEffect, useMemo, useState } from 'react';
+import type { MouseEvent } from 'react';
+import {
+  Bot,
+  ChevronDown,
+  MessageCircle,
+  Search,
+  SearchX,
+  Zap,
+} from 'lucide-react';
+import { FilterSidebar } from './components/FilterSidebar';
+import { ProductCard } from './components/ProductCard';
+import { StorefrontChat } from './components/StorefrontChat';
+import { storefrontCopy } from './content/storefrontCopy';
+import { COLOR_ORDER, canonicalColorToken, matchesColors, sortColors } from './lib/colors';
+import { createStorefrontHandoff, trackStorefrontEvent } from './lib/storefrontEvents';
+import { isSupabaseConfigured, supabase } from './lib/supabase';
 import './index.css';
 
-// --- CONSTANTS ---
-// Default to Sandbox, User can change this in code or env if needed.
-const WHATSAPP_NUMBER = "14155238886";
-const WHATSAPP_LINK = `https://wa.me/${WHATSAPP_NUMBER}?text=Hola,%20quisiera%20ver%20el%20catalogo`;
+const FALLBACK_WHATSAPP_NUMBER = '14155238886';
+const PLACEHOLDER_IMG = 'https://images.unsplash.com/photo-1549298916-b41d501d3772?auto=format&fit=crop&w=900&q=80';
+const PRODUCT_FETCH_TIMEOUT_MS = 4500;
 
-// Safe Placeholder for when DB image is missing/broken
-const PLACEHOLDER_IMG = "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a6/Sneakers.jpg/640px-Sneakers.jpg";
+interface ProductVariant {
+  size: number;
+  stock: number;
+  reserved: number;
+}
+
+interface ProductMedia {
+  url: string;
+  media_type?: string;
+  is_primary?: boolean;
+  created_at?: string;
+}
 
 interface Product {
   id: string;
   brand: string;
   model: string;
+  colorway?: string | null;
+  colors: string[];
+  category?: string | null;
+  description?: string | null;
   price_cents: number;
-  media_url?: string;
+  created_at?: string | null;
+  media_url: string;
+  variants: ProductVariant[];
+  available_sizes: number[];
+  available_units: number;
+  is_new: boolean;
+}
+
+type SortMode = 'recommended' | 'price_asc' | 'price_desc' | 'stock_desc';
+
+function getWhatsAppNumber() {
+  return (import.meta.env.VITE_WHATSAPP_NUMBER || FALLBACK_WHATSAPP_NUMBER).replace(/\D/g, '');
+}
+
+function buildWhatsAppLink(message: string) {
+  return `https://wa.me/${getWhatsAppNumber()}?text=${encodeURIComponent(message)}`;
+}
+
+function buildProductWhatsAppLink(product: Product, size?: number, handoffCode?: string) {
+  const sizeText = size ? ` en talla ${size}` : '';
+  const codeText = handoffCode ? `\nCodigo web: ${handoffCode}` : '';
+  return buildWhatsAppLink(
+    `Hola SportBot, vi en la web las ${product.brand} ${product.model}${sizeText}. ` +
+      `¿Me confirmas disponibilidad, fotos y el link de pago?${codeText}`
+  );
+}
+
+function buildGeneralWhatsAppLink(intent: string, handoffCode?: string) {
+  const codeText = handoffCode ? `\nCodigo web: ${handoffCode}` : '';
+  return buildWhatsAppLink(`Hola SportBot, estoy viendo el catálogo web. ${intent}${codeText}`);
+}
+
+function productLabel(product: Product) {
+  return `${product.brand} ${product.model}`;
+}
+
+function productTelemetryMetadata(product: Product, size?: number) {
+  return {
+    product: productLabel(product),
+    product_brand: product.brand,
+    product_model: product.model,
+    size: size ?? null,
+  };
+}
+
+function getAvailableStock(variant: ProductVariant) {
+  return Math.max((variant.stock || 0) - (variant.reserved || 0), 0);
+}
+
+function getMediaUrl(media: ProductMedia[] = []) {
+  const images = media.filter((item) => item.media_type !== 'pdf');
+  const sorted = [...images].sort((a, b) => {
+    if (a.is_primary !== b.is_primary) return a.is_primary ? -1 : 1;
+    return String(b.created_at || '').localeCompare(String(a.created_at || ''));
+  });
+
+  return sorted[0]?.url || PLACEHOLDER_IMG;
+}
+
+async function withTimeout<T>(promise: PromiseLike<T>, timeoutMs: number, message: string) {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
+function normalizeProduct(row: {
+  id: string;
+  brand: string;
+  model: string;
+  colorway?: string | null;
+  colors?: string[] | null;
+  category?: string | null;
+  description?: string | null;
+  price_cents: number;
+  created_at?: string | null;
+  media?: ProductMedia[] | null;
+  variants?: ProductVariant[] | null;
+}): Product {
+  const variants = row.variants || [];
+  const availableSizes = variants
+    .filter((variant) => getAvailableStock(variant) > 0)
+    .map((variant) => Number(variant.size))
+    .sort((a, b) => a - b);
+
+  return {
+    id: row.id,
+    brand: row.brand,
+    model: row.model,
+    colorway: row.colorway,
+    colors: sortColors(Array.isArray(row.colors) ? row.colors : []),
+    category: row.category,
+    description: row.description,
+    price_cents: row.price_cents,
+    created_at: row.created_at,
+    media_url: getMediaUrl(row.media || []),
+    variants,
+    available_sizes: availableSizes,
+    available_units: variants.reduce((sum, variant) => sum + getAvailableStock(variant), 0),
+    is_new: row.created_at
+      ? Date.now() - new Date(row.created_at).getTime() < 14 * 24 * 60 * 60 * 1000
+      : false,
+  };
+}
+
+/**
+ * Catálogo de demostración, solo en desarrollo.
+ *
+ * Se carga con import dinámico y detrás de `import.meta.env.DEV`: así el
+ * catálogo falso no viaja en el bundle de producción. En producción, si el
+ * inventario está vacío o la consulta falla, la página muestra un estado
+ * honesto con salida a WhatsApp. Enseñar modelos que no existen con botón de
+ * compra es peor que no mostrar nada.
+ */
+async function loadDemoProducts(): Promise<Product[]> {
+  if (!import.meta.env.DEV) return [];
+  const { demoCatalog } = await import('./lib/demoCatalog');
+  return demoCatalog.map(normalizeProduct);
 }
 
 export default function App() {
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState('Todos');
+  const [selectedBrands, setSelectedBrands] = useState<string[]>([]);
+  const [selectedColors, setSelectedColors] = useState<string[]>([]);
+  const [selectedSize, setSelectedSize] = useState<number | null>(null);
+  const [priceMax, setPriceMax] = useState(1000000);
+  const [stockOnly, setStockOnly] = useState(true);
+  const [sortMode, setSortMode] = useState<SortMode>('recommended');
+  const [catalogOffline, setCatalogOffline] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatFocusProduct, setChatFocusProduct] = useState<Product | null>(null);
 
   useEffect(() => {
+    let isMounted = true;
+
+    async function fetchProducts() {
+      if (!isSupabaseConfigured) {
+        // Sin Supabase configurado: en desarrollo se muestra el catálogo de
+        // demostración; en producción, un estado honesto.
+        const demo = await loadDemoProducts();
+        if (isMounted) {
+          setProducts(demo);
+          setCatalogOffline(!import.meta.env.DEV);
+          setLoading(false);
+        }
+        return;
+      }
+
+      try {
+        const { data, error } = await withTimeout(
+          supabase
+            .from('products')
+            .select(`
+              id, brand, model, colorway, colors, category, description, price_cents, created_at,
+              media:product_media(url, media_type, is_primary, created_at),
+              variants:product_variants(size, stock, reserved)
+            `)
+            .eq('active', true)
+            .order('created_at', { ascending: false }),
+          PRODUCT_FETCH_TIMEOUT_MS,
+          'Product inventory request timed out'
+        );
+
+        if (error) throw error;
+
+        const normalized = (data || []).map(normalizeProduct);
+        if (isMounted) {
+          if (normalized.length > 0) {
+            setProducts(normalized);
+          } else {
+            const demo = await loadDemoProducts();
+            if (isMounted) {
+              setProducts(demo);
+              setCatalogOffline(!import.meta.env.DEV);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Error fetching products:', err);
+        const demo = await loadDemoProducts();
+        if (isMounted) {
+          setProducts(demo);
+          setCatalogOffline(!import.meta.env.DEV);
+        }
+      } finally {
+        if (isMounted) setLoading(false);
+      }
+    }
+
     fetchProducts();
+
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
-  async function fetchProducts() {
-    try {
-      // Fetch active products with their primary image
-      const { data, error } = await supabase
-        .from('products')
-        .select(`
-          id, brand, model, price_cents,
-          product_media (url)
-        `)
-        .eq('active', true)
-        .limit(6); // Show top 6
+  const brands = useMemo(
+    () => Array.from(new Set(products.map((product) => product.brand).filter(Boolean))).sort(),
+    [products]
+  );
 
-      if (error) throw error;
+  const availableColors = useMemo(() => {
+    const present = new Set(products.flatMap((product) => product.colors));
+    return COLOR_ORDER.filter((color) => present.has(color));
+  }, [products]);
 
-      if (data) {
-        // Transform data to flat structure
-        const formatted = data.map((p: any) => ({
-          id: p.id,
-          brand: p.brand,
-          model: p.model,
-          price_cents: p.price_cents,
-          media_url: p.product_media?.[0]?.url || PLACEHOLDER_IMG
-        }));
-        setProducts(formatted);
-      }
-    } catch (err) {
-      console.error("Error fetching products:", err);
-      // Fallback data for demo purposes if DB connection fails (missing keys)
-      // Fallback data for demo purposes if DB connection fails (missing keys)
-      // Matches seed.sql inventory with reliable external images
-      setProducts([
-        { id: '1', brand: 'Nike', model: 'Air Max 90', price_cents: 45000000, media_url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/2/23/Nike_Air_Max_90_Infrared_%284805905007%29.jpg/640px-Nike_Air_Max_90_Infrared_%284805905007%29.jpg' },
-        { id: '2', brand: 'Nike', model: 'Pegasus 40', price_cents: 52000000, media_url: 'https://static.nike.com/a/images/t_PDP_1280_v1/f_auto,q_auto:eco/ca79d356-6219-4cd6-a51b-5353d3954636/pegasus-40-road-running-shoes-MCnWQB.png' }, // Official Nike Asset
-        { id: '3', brand: 'Adidas', model: 'Ultraboost Light', price_cents: 60000000, media_url: 'https://assets.adidas.com/images/h_840,f_auto,q_auto,fl_lossy,c_fill,g_auto/09c5ea6df1bd4be6baaaac5e003e7047_9366/Ultraboost_Light_Running_Shoes_Black_HQ6339_01_standard.jpg' },
-        { id: '4', brand: 'Adidas', model: 'Forum Low', price_cents: 38000000, media_url: 'https://assets.adidas.com/images/h_840,f_auto,q_auto,fl_lossy,c_fill,g_auto/09c5ea6df1bd4be6baaaac5e003e7047_9366/Forum_Low_Shoes_White_FY7757_01_standard.jpg' },
-        { id: '5', brand: 'Nike', model: 'Dunk Low Panda', price_cents: 48000000, media_url: 'https://static.nike.com/a/images/t_PDP_1280_v1/f_auto,q_auto:eco/5fd39223-f22e-4613-911e-28795da15433/dunk-low-retro-bttys-mens-shoes-87q0hf.png' },
-        { id: '6', brand: 'Nike', model: 'Metcon 9', price_cents: 55000000, media_url: 'https://static.nike.com/a/images/t_PDP_1280_v1/f_auto,q_auto:eco/a037b35f-1490-449e-8c34-080c10b7b134/metcon-9-training-shoes-M2m45k.png' },
-        { id: '7', brand: 'New Balance', model: '550', price_cents: 42000000, media_url: 'https://nb.scene7.com/is/image/NB/bb550wt1_nb_02_i?$pdpflexf2$' },
-        { id: '8', brand: 'Puma', model: 'Velophasis', price_cents: 39000000, media_url: 'https://images.puma.com/image/upload/f_auto,q_auto,b_rgb:fafafa,w_500,h_500/global/390932/01/sv01/fnd/EEA/fmt/png/Zapatillas-Velophasis-Phased' },
-        { id: '9', brand: 'Under Armour', model: 'Curry 11', price_cents: 62000000, media_url: 'https://underarmour.scene7.com/is/image/Underarmour/3026615-100_DEFAULT?rp=standard-0pad|pdpMainDesktop&scl=1&fmt=jpg&qlt=85&resMode=sharp2&cache=on,on&bgc=f0f0f0&wid=1836&hei=1950&size=1500,1500' },
-        { id: '10', brand: 'Jordan', model: 'Air Jordan 1 Low', price_cents: 51000000, media_url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c3/Python-logo-notext.svg/1200px-Python-logo-notext.svg.png' }, // Python Logo (Verified) for Jordan
-      ]);
-    } finally {
-      setLoading(false);
+  const categories = useMemo(() => {
+    const values = Array.from(new Set(products.map((product) => product.category || 'casual'))).sort();
+    return ['Todos', ...values];
+  }, [products]);
+
+  const availableSizes = useMemo(
+    () => Array.from(new Set(products.flatMap((product) => product.available_sizes))).sort((a, b) => a - b),
+    [products]
+  );
+
+  const filteredProducts = useMemo(() => {
+    const term = searchTerm.trim().toLowerCase();
+    // "negras" y "black" no aparecen en el colorway; se llevan al color canónico.
+    const termCanonical = canonicalColorToken(term);
+    const sizeTerm = Number(term.match(/\d{2}/)?.[0] || NaN);
+
+    const filtered = products.filter((product) => {
+      const searchable = `${product.brand} ${product.model} ${product.colorway || ''} ${product.category || ''} ${product.colors.join(' ')}`.toLowerCase();
+      const matchesSearch =
+        !term ||
+        searchable.includes(term) ||
+        searchable.includes(termCanonical) ||
+        (Number.isFinite(sizeTerm) && product.available_sizes.includes(sizeTerm));
+      const matchesCategory = selectedCategory === 'Todos' || (product.category || 'casual') === selectedCategory;
+      const matchesBrand = selectedBrands.length === 0 || selectedBrands.includes(product.brand);
+      const matchesColor = matchesColors(product.colors, selectedColors);
+      const matchesSize = !selectedSize || product.available_sizes.includes(selectedSize);
+      const matchesPrice = product.price_cents / 100 <= priceMax;
+      const matchesStock = !stockOnly || product.available_units > 0;
+
+      return matchesSearch && matchesCategory && matchesBrand && matchesColor && matchesSize && matchesPrice && matchesStock;
+    });
+
+    return filtered.sort((a, b) => {
+      if (sortMode === 'price_asc') return a.price_cents - b.price_cents;
+      if (sortMode === 'price_desc') return b.price_cents - a.price_cents;
+      if (sortMode === 'stock_desc') return b.available_units - a.available_units;
+      return Number(b.is_new) - Number(a.is_new) || b.available_units - a.available_units;
+    });
+  }, [priceMax, products, searchTerm, selectedBrands, selectedCategory, selectedColors, selectedSize, sortMode, stockOnly]);
+
+  const featuredProduct = filteredProducts[0] || products[0];
+
+  function toggleBrand(brand: string) {
+    setSelectedBrands((current) =>
+      current.includes(brand) ? current.filter((item) => item !== brand) : [...current, brand]
+    );
+  }
+
+  function toggleColor(color: string) {
+    setSelectedColors((current) =>
+      current.includes(color) ? current.filter((item) => item !== color) : [...current, color]
+    );
+  }
+
+  function clearFilters() {
+    setSearchTerm('');
+    setSelectedCategory('Todos');
+    setSelectedBrands([]);
+    setSelectedColors([]);
+    setSelectedSize(null);
+    setPriceMax(1000000);
+    setStockOnly(true);
+    setSortMode('recommended');
+  }
+
+  function openChat(product?: Product) {
+    setChatFocusProduct(product || null);
+    setChatOpen(true);
+  }
+
+  function applyChatSearch(query: string) {
+    setSearchTerm(query);
+    setSelectedCategory('Todos');
+    setSelectedBrands([]);
+    setSelectedColors([]);
+    setSelectedSize(null);
+    setStockOnly(true);
+    document.getElementById('catalogo')?.scrollIntoView({ behavior: 'smooth' });
+  }
+
+  function trackGeneralWhatsAppHandoff(
+    intentText: string,
+    surface: string,
+    intent: 'product_search' | 'shipping_status' | 'support' = 'product_search',
+    handoffCode?: string
+  ) {
+    trackStorefrontEvent({
+      event_type: 'handoff_suggested',
+      intent,
+      funnel_stage: intent === 'product_search' ? 'interested' : 'support',
+      metadata: {
+        surface,
+        intent_text: intentText,
+        handoff_code: handoffCode ?? null,
+      },
+    });
+  }
+
+  function trackProductWhatsAppHandoff(product: Product, size: number | undefined, surface: string, handoffCode?: string) {
+    trackStorefrontEvent({
+      event_type: 'handoff_suggested',
+      intent: 'buy_intent',
+      funnel_stage: 'ready_to_order',
+      product_id: product.id,
+      size_requested: size,
+      metadata: {
+        surface,
+        handoff_code: handoffCode ?? null,
+        ...productTelemetryMetadata(product, size),
+      },
+    });
+  }
+
+  function openPendingWhatsAppWindow() {
+    const targetWindow = window.open('', '_blank');
+    if (targetWindow) targetWindow.opener = null;
+    return targetWindow;
+  }
+
+  function navigateToWhatsApp(targetWindow: Window | null, url: string) {
+    if (targetWindow) {
+      targetWindow.location.href = url;
+    } else {
+      window.location.assign(url);
     }
   }
 
-  const formatPrice = (cents: number) => {
-    return new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 }).format(cents / 100); // Assuming cents are actually full COP in DB based on previous logs usually users store full amount, but schema says cents. Checks logic: 45000000 -> 450,000. Wait, 45 million cents is 450k. Correct.
-  };
+  async function createGeneralHandoff(
+    intentText: string,
+    surface: string,
+    intent: 'product_search' | 'shipping_status' | 'support' = 'product_search'
+  ) {
+    const result = await createStorefrontHandoff({
+      source_surface: surface,
+      intent,
+      funnel_stage: intent === 'product_search' ? 'interested' : 'support',
+      metadata: {
+        intent_text: intentText,
+      },
+    });
+    trackGeneralWhatsAppHandoff(intentText, surface, intent, result?.handoffCode);
+    return result?.handoffCode;
+  }
+
+  async function createProductHandoff(product: Product, size: number | undefined, surface: string) {
+    const result = await createStorefrontHandoff({
+      source_surface: surface,
+      product_id: product.id,
+      product_brand: product.brand,
+      product_model: product.model,
+      size_requested: size,
+      intent: 'buy_intent',
+      funnel_stage: 'ready_to_order',
+      metadata: productTelemetryMetadata(product, size),
+    });
+    trackProductWhatsAppHandoff(product, size, surface, result?.handoffCode);
+    return result?.handoffCode;
+  }
+
+  async function handleGeneralWhatsAppClick(
+    event: MouseEvent<HTMLAnchorElement>,
+    intentText: string,
+    surface: string,
+    intent: 'product_search' | 'shipping_status' | 'support' = 'product_search'
+  ) {
+    event.preventDefault();
+    const targetWindow = openPendingWhatsAppWindow();
+    const handoffCode = await createGeneralHandoff(intentText, surface, intent);
+    navigateToWhatsApp(targetWindow, buildGeneralWhatsAppLink(intentText, handoffCode));
+  }
 
   return (
-    <div className="app-container">
-      {/* --- NAVBAR --- */}
-      <motion.nav
-        initial={{ y: -50, opacity: 0 }}
-        animate={{ y: 0, opacity: 1 }}
-        transition={{ duration: 0.8 }}
-        className="navbar"
-      >
-        <div className="logo">SPORTBOT <span className="accent">.</span></div>
-        <div className="nav-links">
-          <a href="#catalog">Colección</a>
-          <a href={WHATSAPP_LINK} className="nav-cta">Comprar</a>
-        </div>
-      </motion.nav>
+    <div className="min-h-screen bg-[#f8fafc] text-slate-950 selection:bg-cyan-500 selection:text-white">
+      <nav className="sticky top-0 z-50 border-b border-slate-200 bg-white/90 backdrop-blur-xl">
+        <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-4 sm:px-6">
+          <a href="#catalogo" className="flex items-center gap-3" aria-label="SportBot catalogo">
+            <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-950 text-white shadow-sm">
+              <Zap size={22} aria-hidden="true" />
+            </span>
+            <div>
+              <span className="block text-lg font-black">{storefrontCopy.brand.name}</span>
+              <span className="hidden text-xs font-medium text-slate-500 sm:block">{storefrontCopy.brand.subtitle}</span>
+            </div>
+          </a>
 
-      {/* --- HERO SECTION --- */}
-      <header className="hero-section">
-        <motion.div
-          initial={{ opacity: 0, y: 30 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.8 }}
-          className="hero-text"
-        >
-          <span style={{ color: '#bf4800', fontWeight: 600, fontSize: '0.8rem', textTransform: 'uppercase', display: 'block', marginBottom: '10px' }}>New Arrival</span>
-          <h1>Sneaker<br /> <span className="text-gradient">Collection 2025</span></h1>
-          <p>La combinación perfecta de estilo icónico y tecnología de punta.</p>
+          <div className="hidden items-center gap-2 md:flex">
+            {categories.slice(0, 5).map((category) => (
+              <button
+                key={category}
+                type="button"
+                onClick={() => setSelectedCategory(category)}
+                className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                  selectedCategory === category ? 'bg-slate-950 text-white' : 'text-slate-600 hover:bg-slate-100 hover:text-slate-950'
+                }`}
+              >
+                {category === 'Todos' ? 'Todo' : category}
+              </button>
+            ))}
+          </div>
 
-          <motion.a
-            href={WHATSAPP_LINK}
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-            className="hero-btn"
+          <a
+            href={buildGeneralWhatsAppLink(storefrontCopy.whatsappIntents.navHelp)}
+            target="_blank"
+            rel="noreferrer"
+            onClick={(event) => handleGeneralWhatsAppClick(event, storefrontCopy.whatsappIntents.navHelp, 'nav_whatsapp')}
+            className="inline-flex h-10 shrink-0 items-center gap-2 rounded-full bg-emerald-500 px-3 text-sm font-bold text-white shadow-sm transition hover:bg-emerald-600 sm:px-4"
           >
-            Comprar Ahora
-          </motion.a>
-        </motion.div>
+            <MessageCircle size={18} aria-hidden="true" />
+            <span className="hidden sm:inline">{storefrontCopy.nav.whatsapp}</span>
+            <span className="sm:hidden">{storefrontCopy.nav.whatsappShort}</span>
+          </a>
+        </div>
+      </nav>
 
-        <motion.div
-          initial={{ opacity: 0, scale: 0.95 }}
-          animate={{ opacity: 1, scale: 1 }}
-          transition={{ duration: 0.8, delay: 0.2 }}
-          className="hero-visual"
-        >
-          {/* Using the Nike Air Max as hero for clean look */}
-          <img src="https://static.nike.com/a/images/t_PDP_1280_v1/f_auto,q_auto:eco/ca79d356-6219-4cd6-a51b-5353d3954636/pegasus-40-road-running-shoes-MCnWQB.png" alt="Hero Sneaker" />
-        </motion.div>
-      </header>
+      <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:py-8">
+        <section aria-labelledby="catalog-title">
+          <div className="relative min-w-0 overflow-hidden rounded-2xl bg-slate-950 px-6 py-7 text-white shadow-sm sm:px-8">
+            <video
+              autoPlay
+              loop
+              muted
+              playsInline
+              preload="metadata"
+              className="absolute inset-0 h-full w-full object-cover opacity-25"
+            >
+              <source src="/Generación_de_Video_de_Zapatilla_Robótica.mp4" type="video/mp4" />
+            </video>
+            <div className="relative max-w-3xl">
+              <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1 text-xs font-bold uppercase tracking-wide text-cyan-100">
+                <span className="h-2 w-2 rounded-full bg-emerald-400" />
+                {storefrontCopy.hero.badge}
+              </div>
+              <h1 id="catalog-title" className="max-w-2xl break-words text-3xl font-black leading-none sm:text-6xl">
+                {storefrontCopy.hero.title}
+              </h1>
+              <p className="mt-5 max-w-2xl break-words text-sm leading-7 text-slate-200 sm:text-base">
+                {storefrontCopy.hero.description}
+              </p>
+              <div className="mt-6 flex flex-col gap-3 sm:flex-row">
+                <button
+                  type="button"
+                  onClick={() => openChat(featuredProduct)}
+                  className="inline-flex h-12 w-full items-center justify-center gap-2 rounded-full bg-white px-5 text-sm font-black text-slate-950 transition hover:bg-cyan-100 sm:w-auto sm:px-6"
+                >
+                  <Bot size={19} aria-hidden="true" />
+                  {storefrontCopy.hero.primaryCta}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => document.getElementById('catalogo')?.scrollIntoView({ behavior: 'smooth' })}
+                  className="inline-flex h-12 w-full items-center justify-center gap-2 rounded-full border border-white/25 bg-white/10 px-5 text-sm font-bold text-white transition hover:bg-white/20 sm:w-auto sm:px-6"
+                >
+                  <ChevronDown size={19} aria-hidden="true" />
+                  {storefrontCopy.hero.secondaryCta}
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
 
-      {/* --- CATALOG SECTION --- */}
-      <section id="catalog" className="catalog-section">
-        <motion.h2
-          initial={{ opacity: 0, y: 20 }}
-          whileInView={{ opacity: 1, y: 0 }}
-          viewport={{ once: true }}
-        >
-          Lo último.
-        </motion.h2>
+        <section id="catalogo" className="mt-8 scroll-mt-24">
+          <div className="mb-5 flex min-w-0 flex-col gap-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <h2 className="text-2xl font-black">{storefrontCopy.catalog.title}</h2>
+              <p className="mt-1 text-sm text-slate-500">
+                {loading ? storefrontCopy.catalog.loading : `${filteredProducts.length} ${storefrontCopy.catalog.foundSuffix}`}
+              </p>
+            </div>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+              <label className="relative block min-w-0 sm:w-80">
+                <Search
+                  size={20}
+                  className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"
+                  aria-hidden="true"
+                />
+                <input
+                  value={searchTerm}
+                  onChange={(event) => setSearchTerm(event.target.value)}
+                  placeholder={storefrontCopy.catalog.searchPlaceholder}
+                  className="h-11 w-full rounded-xl border border-slate-200 bg-slate-50 pl-10 pr-3 text-sm font-medium outline-none transition focus:border-cyan-400 focus:bg-white focus:ring-4 focus:ring-cyan-100"
+                />
+              </label>
+              <select
+                value={sortMode}
+                onChange={(event) => setSortMode(event.target.value as SortMode)}
+                className="h-11 rounded-xl border border-slate-200 bg-white px-3 text-sm font-bold text-slate-700 outline-none focus:border-cyan-400 focus:ring-4 focus:ring-cyan-100"
+              >
+                <option value="recommended">{storefrontCopy.catalog.sort.recommended}</option>
+                <option value="stock_desc">{storefrontCopy.catalog.sort.stockDesc}</option>
+                <option value="price_asc">{storefrontCopy.catalog.sort.priceAsc}</option>
+                <option value="price_desc">{storefrontCopy.catalog.sort.priceDesc}</option>
+              </select>
+            </div>
+          </div>
 
-        <div className="product-grid">
-          <AnimatePresence>
-            {loading ? (
-              // Skeleton Loader
-              Array.from({ length: 6 }).map((_, i) => (
-                <div key={i} className="product-card-apple" style={{ height: '400px', background: 'white' }}>
-                  <div style={{ height: '280px', background: '#f5f5f7', animation: 'pulse 1.5s infinite' }}></div>
-                  <div style={{ padding: '24px' }}>
-                    <div style={{ height: '20px', width: '60%', background: '#eee', marginBottom: '10px' }}></div>
-                    <div style={{ height: '15px', width: '40%', background: '#eee' }}></div>
+          <div className="grid gap-6 lg:grid-cols-[270px_1fr]">
+            <FilterSidebar
+              brands={brands}
+              categories={categories}
+              availableColors={availableColors}
+              availableSizes={availableSizes}
+              selectedCategory={selectedCategory}
+              selectedBrands={selectedBrands}
+              selectedColors={selectedColors}
+              selectedSize={selectedSize}
+              priceMax={priceMax}
+              stockOnly={stockOnly}
+              onCategoryChange={setSelectedCategory}
+              onBrandToggle={toggleBrand}
+              onColorToggle={toggleColor}
+              onColorClear={() => setSelectedColors([])}
+              onSizeChange={setSelectedSize}
+              onPriceMaxChange={setPriceMax}
+              onStockOnlyChange={setStockOnly}
+              onClear={clearFilters}
+            />
+
+            <div>
+              {loading ? (
+                <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-3">
+                  {Array.from({ length: 6 }).map((_, index) => (
+                    <div key={index} className="animate-pulse rounded-2xl border border-slate-200 bg-white p-3">
+                      <div className="aspect-square rounded-xl bg-slate-100" />
+                      <div className="mt-4 h-4 w-2/3 rounded bg-slate-100" />
+                      <div className="mt-3 h-4 w-1/2 rounded bg-slate-100" />
+                    </div>
+                  ))}
+                </div>
+              ) : filteredProducts.length > 0 ? (
+                <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-3">
+                  {filteredProducts.map((product) => (
+                    <ProductCard
+                      key={product.id}
+                      product={product}
+                      buildWhatsAppLink={buildProductWhatsAppLink}
+                      onAskAssistant={openChat}
+                      onWhatsAppHandoff={createProductHandoff}
+                    />
+                  ))}
+                </div>
+              ) : catalogOffline ? (
+                <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-8 text-center">
+                  <SearchX size={48} className="mx-auto text-slate-300" aria-hidden="true" />
+                  <h3 className="mt-3 text-xl font-black">No pudimos cargar el inventario</h3>
+                  <p className="mx-auto mt-2 max-w-md text-sm text-slate-500">
+                    Es un problema nuestro, no tuyo. Escríbenos y te confirmamos disponibilidad,
+                    tallas y precios al momento.
+                  </p>
+                  <div className="mt-5 flex flex-col justify-center gap-3 sm:flex-row">
+                    <a
+                      href={buildGeneralWhatsAppLink(storefrontCopy.whatsappIntents.noResults)}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={(event) => handleGeneralWhatsAppClick(event, storefrontCopy.whatsappIntents.noResults, 'catalog_offline_whatsapp')}
+                      className="inline-flex h-11 items-center justify-center rounded-xl bg-emerald-500 px-4 text-sm font-black text-white transition hover:bg-emerald-600"
+                    >
+                      {storefrontCopy.emptyState.whatsappCta}
+                    </a>
                   </div>
                 </div>
-              ))
-            ) : (
-              products.map((p, i) => (
-                <motion.div
-                  key={p.id}
-                  initial={{ opacity: 0, scale: 0.98 }}
-                  whileInView={{ opacity: 1, scale: 1 }}
-                  viewport={{ once: true }}
-                  transition={{ delay: i * 0.05 }}
-                  className="product-card-apple"
-                  onClick={() => alert(`Vista rápida de ${p.model} (Próximamente)`)}
-                >
-                  <div className="img-wrapper">
-                    <img src={p.media_url} alt={p.model} />
+              ) : (
+                <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-8 text-center">
+                  <SearchX size={48} className="mx-auto text-slate-300" aria-hidden="true" />
+                  <h3 className="mt-3 text-xl font-black">{storefrontCopy.emptyState.title}</h3>
+                  <p className="mx-auto mt-2 max-w-md text-sm text-slate-500">
+                    {storefrontCopy.emptyState.description}
+                  </p>
+                  <div className="mt-5 flex flex-col justify-center gap-3 sm:flex-row">
+                    <button
+                      type="button"
+                      onClick={clearFilters}
+                      className="inline-flex h-11 items-center justify-center rounded-xl border border-slate-200 px-4 text-sm font-bold text-slate-700 transition hover:bg-slate-50"
+                    >
+                      {storefrontCopy.emptyState.clearCta}
+                    </button>
+                    <a
+                      href={buildGeneralWhatsAppLink(storefrontCopy.whatsappIntents.noResults)}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={(event) => handleGeneralWhatsAppClick(event, storefrontCopy.whatsappIntents.noResults, 'empty_state_whatsapp')}
+                      className="inline-flex h-11 items-center justify-center rounded-xl bg-emerald-500 px-4 text-sm font-black text-white transition hover:bg-emerald-600"
+                    >
+                      {storefrontCopy.emptyState.whatsappCta}
+                    </a>
                   </div>
-                  <div className="card-info">
-                    {i < 3 && <div className="new-badge">Nuevo</div>}
-                    <h3>{p.brand}</h3>
-                    <h4>{p.model}</h4>
-                    <span className="price">{formatPrice(p.price_cents)}</span>
-                  </div>
-                </motion.div>
-              ))
-            )}
-          </AnimatePresence>
-        </div>
-      </section>
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+      </main>
 
-      {/* --- FOOTER --- */}
-      <footer style={{ background: '#f5f5f7', padding: '60px 5%', fontSize: '0.8rem', color: '#86868b', borderTop: '1px solid #d2d2d7' }}>
-        <div style={{ maxWidth: '1000px', margin: '0 auto', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '40px' }}>
+      <footer className="mt-10 border-t border-slate-200 bg-white px-4 py-8 text-sm text-slate-500 sm:px-6">
+        <div className="mx-auto flex max-w-7xl flex-col gap-4 md:flex-row md:items-center md:justify-between">
           <div>
-            <h4 style={{ color: '#1d1d1f', marginBottom: '15px' }}>Comprar y Aprender</h4>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              <span>Store</span>
-              <span>Mac</span>
-              <span>iPad</span>
-              <span>iPhone</span>
-            </div>
+            <p className="font-black text-slate-950">{storefrontCopy.footer.brand}</p>
+            <p>{storefrontCopy.footer.description}</p>
           </div>
-          <div>
-            <h4 style={{ color: '#1d1d1f', marginBottom: '15px' }}>Cuenta</h4>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              <span>Gestionar tu ID</span>
-              <span>Cuenta del Apple Store</span>
-              <span>iCloud.com</span>
-            </div>
+          <div className="flex flex-wrap gap-4">
+            <a href={buildGeneralWhatsAppLink(storefrontCopy.whatsappIntents.shipping)} target="_blank" rel="noreferrer" onClick={(event) => handleGeneralWhatsAppClick(event, storefrontCopy.whatsappIntents.shipping, 'footer_shipping', 'shipping_status')} className="font-semibold hover:text-slate-950">
+              {storefrontCopy.footer.shipping}
+            </a>
+            <a href={buildGeneralWhatsAppLink(storefrontCopy.whatsappIntents.payments)} target="_blank" rel="noreferrer" onClick={(event) => handleGeneralWhatsAppClick(event, storefrontCopy.whatsappIntents.payments, 'footer_payments', 'support')} className="font-semibold hover:text-slate-950">
+              {storefrontCopy.footer.payments}
+            </a>
+            <a href={buildGeneralWhatsAppLink(storefrontCopy.whatsappIntents.support)} target="_blank" rel="noreferrer" onClick={(event) => handleGeneralWhatsAppClick(event, storefrontCopy.whatsappIntents.support, 'footer_support', 'support')} className="font-semibold hover:text-slate-950">
+              {storefrontCopy.footer.support}
+            </a>
           </div>
-          <div>
-            <h4 style={{ color: '#1d1d1f', marginBottom: '15px' }}>SportBot</h4>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              <span>Encontrar una tienda</span>
-              <span>Genius Bar</span>
-              <span>Today at Apple</span>
-              <span>App de Apple Store</span>
-            </div>
-          </div>
-        </div>
-        <div style={{ maxWidth: '1000px', margin: '40px auto 0', borderTop: '1px solid #d2d2d7', paddingTop: '20px' }}>
-          Copyright © 2025 SportBot Inc. Todos los derechos reservados.
         </div>
       </footer>
-
-      {/* --- FLOATING WHATSAPP --- */}
-      <motion.a
-        href={WHATSAPP_LINK}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="whatsapp-float-btn"
-        whileHover={{ scale: 1.1 }}
-        whileTap={{ scale: 0.9 }}
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512" width="28" fill="white">
-          <path d="M380.9 97.1C339 55.1 283.2 32 223.9 32c-122.4 0-222 99.6-222 222 0 39.1 10.2 77.3 29.6 111L0 480l117.7-30.9c32.4 17.7 68.9 27 106.1 27h.1c122.3 0 224.1-99.6 224.1-222 0-59.3-25.2-115-67.1-157zm-157 341.6c-33.2 0-65.7-8.9-94-25.7l-6.7-4-69.8 18.3L72 359.2l-4.4-7c-18.5-29.4-28.2-63.3-28.2-98.2 0-101.7 82.8-184.5 184.6-184.5 49.3 0 95.6 19.2 130.4 54.1 34.8 34.9 56.2 81.2 56.1 130.5 0 101.8-84.9 184.6-186.6 184.6zm101.2-138.2c-5.5-2.8-32.8-16.2-37.9-18-5.1-1.9-8.8-2.8-12.5 2.8-3.7 5.6-14.3 18-17.6 21.8-3.2 3.7-6.5 4.2-12 1.4-32.6-16.3-54-29.1-75.5-66-5.7-9.8 5.7-9.1 16.3-30.3 1.8-3.7.9-6.9-.5-9.7-1.4-2.8-12.5-30.1-17.1-41.2-4.5-10.8-9.1-9.3-12.5-9.5-3.2-.2-6.9-.2-10.6-.2-3.7 0-9.7 1.4-14.8 6.9-5.1 5.6-19.4 19-19.4 46.3 0 27.3 19.9 53.7 22.6 57.4 2.8 3.7 39.1 59.7 94.8 83.8 35.2 15.2 49 16.5 66.6 13.9 10.7-1.6 32.8-13.4 37.4-26.4 4.6-13 4.6-24.1 3.2-26.4-1.3-2.5-5-3.9-10.5-6.6z" />
-        </svg>
-      </motion.a>
+      <StorefrontChat
+        products={products}
+        open={chatOpen}
+        focusProduct={chatFocusProduct}
+        onOpenChange={setChatOpen}
+        onApplySearch={applyChatSearch}
+        buildWhatsAppLink={buildProductWhatsAppLink}
+        buildGeneralWhatsAppLink={buildGeneralWhatsAppLink}
+        onWhatsAppHandoff={createProductHandoff}
+      />
     </div>
   );
 }

@@ -16,12 +16,22 @@ DROP POLICY IF EXISTS "Public profiles are viewable by everyone" ON product_medi
 CREATE POLICY "Public profiles are viewable by everyone" ON product_media FOR SELECT USING (true);
 
 -- Storage bucket (Idempotent)
-INSERT INTO storage.buckets (id, name, public) 
-VALUES ('product-media', 'product-media', true)
-ON CONFLICT (id) DO NOTHING;
+-- Ver nota en 20251221_phase3_media.sql: `storage` no existe en local al migrar.
+DO $storage$
+BEGIN
+    IF to_regclass('storage.buckets') IS NULL THEN
+        RAISE NOTICE 'storage no disponible: se omiten buckets/politicas de storage';
+        RETURN;
+    END IF;
 
-DROP POLICY IF EXISTS "Public Access" ON storage.objects;
-CREATE POLICY "Public Access" ON storage.objects FOR SELECT USING (bucket_id = 'product-media');
+    INSERT INTO storage.buckets (id, name, public)
+    VALUES ('product-media', 'product-media', true)
+    ON CONFLICT (id) DO NOTHING;
+
+    DROP POLICY IF EXISTS "Public Access" ON storage.objects;
+    CREATE POLICY "Public Access" ON storage.objects FOR SELECT USING (bucket_id = 'product-media');
+END
+$storage$;
 
 -- SEED DATA FOR IMAGES (Using SKUs to find IDs)
 DO $$
@@ -53,6 +63,6 @@ BEGIN
     SELECT id INTO vid FROM products WHERE sku = 'UA-CUR-009';
     IF vid IS NOT NULL AND NOT EXISTS (SELECT 1 FROM product_media WHERE product_id = vid AND type = 'image') THEN
         INSERT INTO product_media (product_id, type, url, is_primary)
-        VALUES (vid, 'image', 'https://underarmour.scene7.com/is/image/Underarmour/3026615-100_DEFAULT?rp=standard-0pad|pdpMainDesktop&scl=1&fmt=jpg&qlt=85', true);
+        VALUES (vid, 'image', 'https://underarmour.scene7.com/is/image/Underarmour/2025550107_DEFAULT?rp=standard-0pad|pdpMainDesktop&scl=1&fmt=jpg&qlt=85', true);
     END IF;
 END $$;

@@ -1,0 +1,13 @@
+{
+  "event": "connection.update",
+  "instance": "sportbot",
+  "data": {
+    "instance": "sportbot",
+    "state": "connecting",
+    "statusReason": 200
+  },
+  "destination": "<redacted>",
+  "date_time": "2026-10-26T02:35:51.911Z",
+  "server_url": "<redacted>",
+  "apikey": "<redacted: llegaba en el webhook>"
+}

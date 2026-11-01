@@ -1,0 +1,26 @@
+project_id = "sportbot-ia"
+
+# External providers do not send Supabase JWTs. These handlers authenticate
+# requests with provider-specific signatures/secrets inside the function.
+[functions.twilio_inbound_whatsapp]
+verify_jwt = false
+
+[functions.wompi_events]
+verify_jwt = false
+
+[functions.telegram_admin_webhook]
+verify_jwt = false
+
+[functions.payment_redirect]
+verify_jwt = false
+
+[functions.storefront_events]
+verify_jwt = false
+
+# La decision la toma un admin autenticado; exige JWT y ademas requireAdmin.
+[functions.payment_decision_notify]
+verify_jwt = true
+
+# El Agent Proxy (MCP) usa un secreto propio de gateway, no un JWT de Supabase.
+[functions.agent_mcp]
+verify_jwt = false

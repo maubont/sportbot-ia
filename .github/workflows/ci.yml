@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "release/public-sanitized-2026-11-01"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Typecheck, lint, build and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm build
+      - run: pnpm test:admin
+      - run: pnpm test:frontend
+      - run: pnpm test:supabase
+      - run: pnpm test:stage-a
+      - run: pnpm test:stage-b
+
+  sql:
+    name: SQL verifies (PGlite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Run SQL verifies sequentially
+        run: |
+          node scripts/verify-stage-a-sql.mjs
+          node scripts/verify-stage-b-sql.mjs
+          node scripts/verify-e3-sql.mjs
+          node scripts/verify-e3-shortfall-sql.mjs
+          node scripts/verify-e4-sql.mjs
+          node scripts/verify-human-messaging-sql.mjs
+          node scripts/verify-logistics-retry-sql.mjs
+          node scripts/verify-colors-sql.mjs
+          node scripts/verify-catalog-operable-sql.mjs
+          node scripts/verify-order-ficha-sql.mjs
+          node scripts/verify-p2-payment-fee-sql.mjs
+          node scripts/verify-security-grants-sql.mjs
+          node scripts/verify-rpc-actor-hardening-sql.mjs
+          node scripts/verify-admin-role-hardening-sql.mjs
+          node scripts/verify-operator-order-column-hardening-sql.mjs
+          node scripts/verify-agent-mcp-sql.mjs
+
+  deno:
+    name: Edge Functions type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: |
+          deno check \
+            supabase/functions/twilio_inbound_whatsapp/index.ts \
+            supabase/functions/admin_conversation_actions/index.ts \
+            supabase/functions/ops_sweep/index.ts \
+            supabase/functions/payment_decision_notify/index.ts \
+            supabase/functions/agent_mcp/index.ts
+
+  hygiene:
+    name: Secret hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No secret files tracked
+        run: |
+          if git ls-files | grep -E '(^|/)\.env(\.local)?$|cleanup-job-secret|(^|/)test-allowlist\.txt$'; then
+            echo "::error::A secret-like file is tracked by git"
+            exit 1
+          fi
+          echo "No secret-like files tracked"

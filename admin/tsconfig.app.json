@@ -13,6 +13,7 @@
     "skipLibCheck": true,
     /* Bundler mode */
     "allowSyntheticDefaultImports": true,
+    "allowImportingTsExtensions": true,
     "baseUrl": ".",
     "paths": {
       "@/*": [

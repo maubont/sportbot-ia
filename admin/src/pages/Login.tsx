@@ -1,48 +1,67 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
+import { useAuth } from "@/lib/auth-context";
+import { getAdminUrl } from "@/lib/auth-url";
 
 export default function Login() {
-    const [mode, setMode] = useState<'login' | 'signup'>('login');
+    const navigate = useNavigate();
+    const location = useLocation();
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
     const [loading, setLoading] = useState(false);
+    const [resetLoading, setResetLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
-    const navigate = useNavigate();
+    const [notice, setNotice] = useState<string | null>(
+        (location.state as { notice?: string } | null)?.notice || null
+    );
+    const { user } = useAuth();
+    const redirectTo = (location.state as { from?: { pathname?: string } } | null)?.from?.pathname || "/";
+
+    useEffect(() => {
+        if (user) navigate(redirectTo, { replace: true });
+    }, [navigate, redirectTo, user]);
 
     async function handleAuth(e: React.FormEvent) {
         e.preventDefault();
         setLoading(true);
         setError(null);
+        setNotice(null);
 
-        if (mode === 'login') {
-            const { error } = await supabase.auth.signInWithPassword({
-                email,
-                password,
-            });
-            if (error) {
-                setError(error.message);
-                setLoading(false);
-            } else {
-                navigate("/");
-            }
+        const { error } = await supabase.auth.signInWithPassword({
+            email,
+            password,
+        });
+
+        if (error) {
+            setError(error.message);
+            setLoading(false);
         } else {
-            const { error } = await supabase.auth.signUp({
-                email,
-                password,
-            });
-            if (error) {
-                setError(error.message);
-                setLoading(false);
-            } else {
-                // Check if auto-login happened or if email confirmation is needed
-                // Usually for dev it's auto-confirm off or on. 
-                // Assuming successful signup
-                alert("Cuenta creada. Revisa tu email o intenta iniciar sesión.");
-                setMode('login');
-                setLoading(false);
-            }
+            navigate(redirectTo, { replace: true });
         }
+    }
+
+    async function handlePasswordReset() {
+        setError(null);
+        setNotice(null);
+
+        if (!email) {
+            setError("Escribe tu email para enviarte el enlace de recuperación.");
+            return;
+        }
+
+        setResetLoading(true);
+        const { error } = await supabase.auth.resetPasswordForEmail(email, {
+            redirectTo: getAdminUrl("/set-password"),
+        });
+        setResetLoading(false);
+
+        if (error) {
+            setError(error.message);
+            return;
+        }
+
+        setNotice("Te enviamos un enlace para crear o recuperar tu contraseña.");
     }
 
     return (
@@ -50,10 +69,10 @@ export default function Login() {
             <div className="w-full max-w-md space-y-8 p-8 bg-white rounded-lg shadow-md">
                 <div className="text-center">
                     <h2 className="text-3xl font-bold tracking-tight text-gray-900">
-                        {mode === 'login' ? 'SportBot Admin' : 'Crear Cuenta'}
+                        SportBot Admin
                     </h2>
                     <p className="mt-2 text-sm text-gray-600">
-                        {mode === 'login' ? 'Inicia sesión para controlar tu negocio' : 'Registra un nuevo administrador'}
+                        Inicia sesión para controlar tu negocio
                     </p>
                 </div>
 
@@ -61,6 +80,11 @@ export default function Login() {
                     {error && (
                         <div className="p-3 text-sm text-red-500 bg-red-50 rounded-md">
                             {error}
+                        </div>
+                    )}
+                    {notice && (
+                        <div className="p-3 text-sm text-emerald-600 bg-emerald-50 rounded-md">
+                            {notice}
                         </div>
                     )}
 
@@ -89,19 +113,18 @@ export default function Login() {
                             disabled={loading}
                             className="group relative flex w-full justify-center rounded-md bg-black px-3 py-2 text-sm font-semibold text-white hover:bg-gray-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-black disabled:opacity-50"
                         >
-                            {loading ? "Procesando..." : (mode === 'login' ? "Iniciar Sesión" : "Registrarse")}
+                            {loading ? "Procesando..." : "Iniciar Sesión"}
                         </button>
                     </div>
-                </form>
-
-                <div className="text-center text-sm">
                     <button
-                        className="font-medium text-black hover:underline"
-                        onClick={() => setMode(mode === 'login' ? 'signup' : 'login')}
+                        type="button"
+                        onClick={handlePasswordReset}
+                        disabled={resetLoading}
+                        className="w-full text-center text-sm font-medium text-gray-600 hover:text-gray-900 disabled:opacity-50"
                     >
-                        {mode === 'login' ? "¿No tienes cuenta? Regístrate" : "¿Ya tienes cuenta? Inicia Sesión"}
+                        {resetLoading ? "Enviando enlace..." : "Crear o recuperar contraseña"}
                     </button>
-                </div>
+                </form>
             </div>
         </div>
     );

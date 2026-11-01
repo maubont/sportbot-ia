@@ -17,7 +17,7 @@ SELECT cron.schedule(
   '0 * * * *',                -- Every hour at minute 0
   $$
   SELECT net.http_post(
-    url := 'https://hjusliaruysnbelkjwol.supabase.co/functions/v1/cleanup_zombie_orders',
+    url := 'https://YOUR_SUPABASE_PROJECT_ID.supabase.co/functions/v1/cleanup_zombie_orders',
     headers := jsonb_build_object(
       'Authorization', 'Bearer ' || current_setting('supabase.service_role_key', true),
       'Content-Type', 'application/json'
