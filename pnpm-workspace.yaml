@@ -4,3 +4,6 @@ packages:
   - "packages/*"
 
 verifyDepsBeforeRun: false
+
+onlyBuiltDependencies:
+  - esbuild
