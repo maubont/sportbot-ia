@@ -4,7 +4,7 @@ import {
     TOOLS,
     CURRENT_PROTOCOL,
     SUPPORTED_PROTOCOLS,
-    authorizeRequest,
+    canUseTool,
     handleJsonRpc,
     negotiateProtocol,
     validateMcpHttpRequest,
@@ -15,12 +15,15 @@ function request(headers = {}) {
     return new Request("https://example.test/functions/v1/agent_mcp", { method: "POST", headers });
 }
 
-test("auth: fail-closed y acepta bearer o x-agent-secret", () => {
-    assert.equal(authorizeRequest(request(), ""), false, "sin secreto configurado no se acepta");
-    assert.equal(authorizeRequest(request(), "s3cret"), false, "sin credencial no se acepta");
-    assert.equal(authorizeRequest(request({ authorization: "Bearer s3cret" }), "s3cret"), true);
-    assert.equal(authorizeRequest(request({ "x-agent-secret": "s3cret" }), "s3cret"), true);
-    assert.equal(authorizeRequest(request({ authorization: "Bearer otro" }), "s3cret"), false);
+test("allowlist: operator no recibe herramientas financieras y rol ausente falla cerrado", () => {
+    for (const role of ["owner", "admin", "operator"]) {
+        assert.equal(canUseTool(role, "list_inventory_alerts"), true);
+        for (const tool of ["get_operations_brief", "list_payment_queue", "get_order", "list_logistics_queue", "create_agent_action"]) {
+            assert.equal(canUseTool(role, tool), false);
+        }
+    }
+    assert.equal(canUseTool(undefined, "list_inventory_alerts"), false);
+    assert.equal(canUseTool("operator", "list_payment_queue"), false);
 });
 
 test("protocolo: negocia versión soportada y cae a la más reciente", () => {
@@ -94,7 +97,7 @@ test("Streamable HTTP moderno valida metadata, headers y Origin", () => {
     assert.equal(nameResult.response.error.code, -32020);
 });
 
-test("tools/list expone seis herramientas y separa lectura de propuesta", () => {
+test("el catálogo mantiene seis definiciones y filtra la exposición por rol", () => {
     assert.equal(TOOLS.length, 6);
     const names = TOOLS.map((tool) => tool.name);
     assert.deepEqual(names, [
@@ -186,19 +189,70 @@ test("MCP moderno: server/discover, tools/list y tools/call", async () => {
     const list = await handleJsonRpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }, execute, {
         era: "modern",
         protocolVersion: CURRENT_PROTOCOL,
+        role: "operator",
     });
     assert.equal(list.result.resultType, "complete");
-    assert.equal(list.result.tools.length, 6);
+    assert.deepEqual(list.result.tools.map((tool) => tool.name), ["list_inventory_alerts"]);
+    assert.equal("cacheScope" in list.result, false);
 
     const call = await handleJsonRpc({
         jsonrpc: "2.0",
         id: 3,
         method: "tools/call",
-        params: { name: "get_operations_brief", arguments: {} },
-    }, execute, { era: "modern", protocolVersion: CURRENT_PROTOCOL });
+        params: { name: "list_inventory_alerts", arguments: {} },
+    }, execute, { era: "modern", protocolVersion: CURRENT_PROTOCOL, role: "operator" });
     assert.equal(call.result.resultType, "complete");
     assert.equal(call.result.isError, false);
-    assert.deepEqual(call.result.structuredContent, { tool: "get_operations_brief", args: {} });
+    assert.deepEqual(call.result.structuredContent, { tool: "list_inventory_alerts", args: { limit: 10 } });
+
+    let executed = false;
+    let audited = false;
+    const denied = await handleJsonRpc({
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: { name: "list_payment_queue", arguments: {} },
+    }, async () => { executed = true; return {}; }, {
+        era: "modern",
+        protocolVersion: CURRENT_PROTOCOL,
+        role: "operator",
+        onDenied: async (name) => { audited = name === "list_payment_queue"; },
+    });
+    assert.equal(denied.result.isError, true);
+    assert.equal(executed, false);
+    assert.equal(audited, true);
+
+    const rejectedNames = [];
+    const invalid = await handleJsonRpc({
+        jsonrpc: "2.0",
+        id: 6,
+        method: "tools/call",
+        params: { name: "list_inventory_alerts", arguments: { limit: 999 } },
+    }, execute, {
+        era: "modern",
+        protocolVersion: CURRENT_PROTOCOL,
+        role: "operator",
+        onDenied: async (name) => { rejectedNames.push(name); },
+    });
+    assert.equal(invalid.result.isError, true);
+    assert.deepEqual(rejectedNames, ["list_inventory_alerts"]);
+
+    const unknown = await handleJsonRpc({
+        jsonrpc: "2.0",
+        id: 7,
+        method: "tools/call",
+        params: { name: "not_a_tool", arguments: { freeform: "redacted" } },
+    }, execute, {
+        era: "modern",
+        protocolVersion: CURRENT_PROTOCOL,
+        role: "operator",
+        onDenied: async (name, args) => { rejectedNames.push(`${name}:${Object.keys(args).join(",")}`); },
+    });
+    assert.equal(unknown.error.code, -32602);
+    assert.equal(rejectedNames.at(-1), "not_a_tool:freeform");
+
+    const noRole = await handleJsonRpc({ jsonrpc: "2.0", id: 5, method: "tools/list" }, execute, { era: "modern" });
+    assert.deepEqual(noRole.result.tools, []);
 });
 
 test("legacy Streamable HTTP sigue aceptando initialize y protocol-version", async () => {
@@ -215,8 +269,9 @@ test("legacy Streamable HTTP sigue aceptando initialize y protocol-version", asy
     const legacyList = await handleJsonRpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }, execute, {
         era: "legacy",
         protocolVersion: "2025-11-25",
+        role: "admin",
     });
-    assert.equal(legacyList.result.tools.length, 6);
+    assert.deepEqual(legacyList.result.tools.map((tool) => tool.name), ["list_inventory_alerts"]);
 });
 
 test("JSON-RPC: errores de protocolo y de herramienta", async () => {
@@ -237,18 +292,18 @@ test("JSON-RPC: errores de protocolo y de herramienta", async () => {
         jsonrpc: "2.0",
         id: 3,
         method: "tools/call",
-        params: { name: "get_order", arguments: {} },
-    }, execute, { era: "modern", protocolVersion: CURRENT_PROTOCOL });
+        params: { name: "list_inventory_alerts", arguments: { limit: 999 } },
+    }, execute, { era: "modern", protocolVersion: CURRENT_PROTOCOL, role: "operator" });
     assert.equal(invalidArgs.result.resultType, "complete");
     assert.equal(invalidArgs.result.isError, true);
-    assert.match(invalidArgs.result.content[0].text, /Indica exactamente uno/);
+    assert.match(invalidArgs.result.content[0].text, /limit debe ser un entero/);
 
     const failing = await handleJsonRpc({
         jsonrpc: "2.0",
         id: 4,
         method: "tools/call",
-        params: { name: "get_operations_brief", arguments: {} },
-    }, async () => { throw new Error("db down"); }, { era: "modern", protocolVersion: CURRENT_PROTOCOL });
+        params: { name: "list_inventory_alerts", arguments: {} },
+    }, async () => { throw new Error("db down"); }, { era: "modern", protocolVersion: CURRENT_PROTOCOL, role: "operator" });
     assert.equal(failing.result.resultType, "complete");
     assert.equal(failing.result.isError, true);
     assert.match(failing.result.content[0].text, /db down/);

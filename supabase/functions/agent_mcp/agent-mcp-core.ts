@@ -29,6 +29,20 @@ export type JsonRpcResponse = {
 
 export type ToolExecutor = (name: string, args: Record<string, unknown>) => Promise<unknown>;
 
+export type StaffRole = "owner" | "admin" | "operator";
+
+// Only this read-only tool is currently verified to work with a user-scoped
+// JWT and RLS. Expand only after each tool has its own role/RLS test matrix.
+export const ROLE_TOOL_ALLOWLIST: Record<StaffRole, readonly string[]> = {
+    owner: ["list_inventory_alerts"],
+    admin: ["list_inventory_alerts"],
+    operator: ["list_inventory_alerts"],
+};
+
+export function canUseTool(role: StaffRole | undefined, toolName: string): boolean {
+    return Boolean(role && ROLE_TOOL_ALLOWLIST[role]?.includes(toolName));
+}
+
 export type ToolDefinition = {
     name: string;
     description: string;
@@ -52,9 +66,9 @@ export const SERVER_INFO = {
 };
 
 export const SERVER_INSTRUCTIONS = [
-    "SportBot Agent Proxy. Solo lectura y propuestas auditadas.",
+    "SportBot Agent Proxy. Usa únicamente las herramientas publicadas para el rol autenticado.",
     "No aprueba pagos, no mueve dinero, no cambia stock, no despacha y no envía mensajes.",
-    "Toda acción sensible se registra en agent_actions como pending_approval y se decide en /ai-ops.",
+    "Las propuestas permitidas requieren revisión humana en /ai-ops; el modelo no puede aprobarlas ni ejecutarlas.",
     "Los datos de contacto se devuelven enmascarados; la ficha completa vive en el Admin.",
 ].join(" ");
 
@@ -185,27 +199,6 @@ export function negotiateProtocol(requested: unknown): string {
         return requested;
     }
     return SUPPORTED_PROTOCOLS[0];
-}
-
-function timingSafeEqual(left: string, right: string): boolean {
-    const a = new TextEncoder().encode(left);
-    const b = new TextEncoder().encode(right);
-    if (a.length !== b.length) return false;
-    let diff = 0;
-    for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-    return diff === 0;
-}
-
-export function authorizeRequest(req: Request, expectedSecret: string | null | undefined): boolean {
-    const secret = (expectedSecret ?? "").trim();
-    if (!secret) return false;
-
-    const authorization = req.headers.get("authorization") ?? "";
-    const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? "";
-    const provided = bearer || (req.headers.get("x-agent-secret") ?? "").trim();
-    if (!provided) return false;
-
-    return timingSafeEqual(provided, secret);
 }
 
 export function jsonRpcResult(id: JsonRpcId, result: unknown): JsonRpcResponse {
@@ -482,7 +475,12 @@ export function validateToolArgs(name: string, rawArgs: unknown): ToolValidation
 export async function handleJsonRpc(
     payload: unknown,
     execute: ToolExecutor,
-    options: { era?: "modern" | "legacy"; protocolVersion?: string } = {},
+    options: {
+        era?: "modern" | "legacy";
+        protocolVersion?: string;
+        role?: StaffRole;
+        onDenied?: (name: string, args: Record<string, unknown>) => Promise<void>;
+    } = {},
 ): Promise<JsonRpcResponse | null> {
     if (!isPlainObject(payload)) {
         return jsonRpcError(null, -32600, "Invalid Request");
@@ -529,18 +527,53 @@ export async function handleJsonRpc(
 
         case "tools/list":
             return completeResult(id, {
-                tools: TOOLS,
-                ...(modern ? { ttlMs: 300_000, cacheScope: "public" } : {}),
+                tools: TOOLS.filter((tool) => canUseTool(options.role, tool.name)),
             }, modern);
 
         case "tools/call": {
             const params = isPlainObject(request.params) ? request.params : {};
             const name = typeof params.name === "string" ? params.name : "";
+            const rawArgs = isPlainObject(params.arguments) ? params.arguments : {};
+            const auditRejectedAttempt = async (): Promise<boolean> => {
+                try {
+                    await options.onDenied?.(name, rawArgs);
+                    return true;
+                } catch {
+                    return false;
+                }
+            };
             const tool = TOOLS.find((item) => item.name === name);
-            if (!tool) return jsonRpcError(id, -32602, `Herramienta desconocida: ${name || "(vacía)"}`);
+            if (!tool) {
+                if (!(await auditRejectedAttempt())) {
+                    return completeResult(id, {
+                        content: [{ type: "text", text: "Invocación rechazada; no fue posible registrar la auditoría." }],
+                        isError: true,
+                    }, modern);
+                }
+                return jsonRpcError(id, -32602, `Herramienta desconocida: ${name || "(vacía)"}`);
+            }
+
+            if (!canUseTool(options.role, name)) {
+                if (!(await auditRejectedAttempt())) {
+                    return completeResult(id, {
+                        content: [{ type: "text", text: "Acceso denegado; no fue posible registrar la auditoría." }],
+                        isError: true,
+                    }, modern);
+                }
+                return completeResult(id, {
+                    content: [{ type: "text", text: "Herramienta no autorizada para el rol actual." }],
+                    isError: true,
+                }, modern);
+            }
 
             const validation = validateToolArgs(name, params.arguments ?? {});
             if (!validation.ok) {
+                if (!(await auditRejectedAttempt())) {
+                    return completeResult(id, {
+                        content: [{ type: "text", text: "Invocación inválida; no fue posible registrar la auditoría." }],
+                        isError: true,
+                    }, modern);
+                }
                 return completeResult(id, {
                     content: [{ type: "text", text: validation.message }],
                     isError: true,

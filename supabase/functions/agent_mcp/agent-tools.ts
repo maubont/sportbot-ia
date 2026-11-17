@@ -79,7 +79,7 @@ async function countRows(query: any, label: string): Promise<number> {
 
 export function createAgentToolExecutor(
     supabase: AnyClient,
-    options: { adminBaseUrl: string },
+    options: { adminBaseUrl: string; allowedTools: readonly string[] },
 ): ToolExecutor {
     const adminUrl = (path: string) => `${options.adminBaseUrl.replace(/\/$/, "")}${path}`;
 
@@ -486,6 +486,9 @@ export function createAgentToolExecutor(
     }
 
     return async (name, args) => {
+        if (!options.allowedTools.includes(name)) {
+            throw new Error("Herramienta no habilitada en el executor de identidad delegada");
+        }
         switch (name) {
             case "get_operations_brief":
                 return await getOperationsBrief();
@@ -513,29 +516,75 @@ export async function recordToolCall(
         status: "ok" | "error" | "denied";
         error?: string | null;
         latencyMs?: number | null;
+        actorUserId: string;
+        actorRole: "owner" | "admin" | "operator";
+        requestId?: string | number | null;
     },
 ): Promise<void> {
-    try {
-        await supabase.from("agent_tool_calls").insert({
-            tool_name: input.toolName.slice(0, 120),
-            arguments: input.args ?? {},
-            status: input.status,
-            error_message: cleanError(input.error, 500),
-            latency_ms: input.latencyMs ?? null,
-            actor: "agent_proxy",
-        });
-    } catch (error) {
-        console.warn("[agent_mcp] audit insert failed", error instanceof Error ? error.message : error);
+    const { error } = await supabase.from("agent_tool_calls").insert({
+        tool_name: input.toolName.slice(0, 120),
+        arguments: input.args ?? {},
+        status: input.status,
+        error_message: cleanError(input.error, 500),
+        latency_ms: input.latencyMs ?? null,
+        actor: "agent_proxy",
+        actor_user_id: input.actorUserId,
+        actor_role: input.actorRole,
+        channel: "agent_mcp_user",
+        request_id: input.requestId === undefined || input.requestId === null ? null : String(input.requestId).slice(0, 200),
+    });
+    if (error) throw new Error("No fue posible registrar la auditoría MCP.");
+}
+
+export async function beginToolCall(
+    supabase: AnyClient,
+    input: {
+        toolName: string;
+        args: Record<string, unknown>;
+        actorUserId: string;
+        actorRole: "owner" | "admin" | "operator";
+        requestId?: string | number | null;
+    },
+): Promise<string> {
+    const { data, error } = await supabase.from("agent_tool_calls").insert({
+        tool_name: input.toolName.slice(0, 120),
+        arguments: input.args ?? {},
+        status: "started",
+        actor: "agent_proxy",
+        actor_user_id: input.actorUserId,
+        actor_role: input.actorRole,
+        channel: "agent_mcp_user",
+        request_id: input.requestId === undefined || input.requestId === null ? null : String(input.requestId).slice(0, 200),
+    }).select("id").single();
+    if (error || typeof data?.id !== "string") {
+        throw new Error("No fue posible iniciar la auditoría MCP; operación bloqueada.");
+    }
+    return data.id;
+}
+
+export async function finishToolCall(
+    supabase: AnyClient,
+    id: string,
+    input: { status: "ok" | "error"; error?: string | null; latencyMs: number },
+): Promise<void> {
+    const { data, error } = await supabase.from("agent_tool_calls").update({
+        status: input.status,
+        error_message: cleanError(input.error, 500),
+        latency_ms: Math.max(0, Math.trunc(input.latencyMs)),
+    }).eq("id", id).select("id").single();
+    if (error || data?.id !== id) {
+        throw new Error("No fue posible finalizar la auditoría MCP; el registro permanece como started.");
     }
 }
 
-export async function assertRateLimit(supabase: AnyClient, maxPerMinute = 60): Promise<void> {
+export async function assertRateLimit(supabase: AnyClient, actorUserId: string, maxPerMinute = 60): Promise<void> {
     const since = new Date(Date.now() - 60_000).toISOString();
     const result = await supabase
         .from("agent_tool_calls")
         .select("id", { count: "exact", head: true })
+        .eq("actor_user_id", actorUserId)
         .gte("created_at", since);
-    if (result.error) return; // fail open on audit read failure; auth is still enforced
+    if (result.error) throw new Error("No fue posible comprobar el límite de uso; operación bloqueada.");
     const count = Number(result.count ?? 0);
     if (count >= maxPerMinute) throw new Error("Rate limit: demasiadas llamadas por minuto");
 }

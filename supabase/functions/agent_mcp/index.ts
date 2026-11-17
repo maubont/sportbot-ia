@@ -1,6 +1,8 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
-import { authorizeRequest, handleJsonRpc, validateMcpHttpRequest } from "./agent-mcp-core.ts";
-import { assertRateLimit, createAgentToolExecutor, recordToolCall } from "./agent-tools.ts";
+import { handleJsonRpc, ROLE_TOOL_ALLOWLIST, validateMcpHttpRequest } from "./agent-mcp-core.ts";
+import { extractUserBearer, IdentityError, resolveStaffIdentity } from "./agent-mcp-auth.ts";
+import type { StaffIdentity } from "./agent-mcp-auth.ts";
+import { assertRateLimit, beginToolCall, createAgentToolExecutor, finishToolCall, recordToolCall } from "./agent-tools.ts";
 
 function allowedOrigins(): string[] {
     return (Deno.env.get("AGENT_MCP_ALLOWED_ORIGINS") ?? "")
@@ -11,7 +13,7 @@ function allowedOrigins(): string[] {
 
 function corsHeadersFor(req: Request, origins: string[]) {
     const headers: Record<string, string> = {
-        "Access-Control-Allow-Headers": "authorization, content-type, accept, x-agent-secret, mcp-protocol-version, mcp-method, mcp-name",
+        "Access-Control-Allow-Headers": "authorization, apikey, content-type, accept, mcp-protocol-version, mcp-method, mcp-name",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
         "Vary": "Origin",
     };
@@ -64,6 +66,25 @@ function serviceClient() {
     });
 }
 
+function userAuthClient() {
+    const url = Deno.env.get("SUPABASE_URL");
+    const key = Deno.env.get("SUPABASE_ANON_KEY") ?? Deno.env.get("SUPABASE_PUBLISHABLE_KEY");
+    if (!url || !key) throw new Error("Supabase user-auth environment is not configured");
+    return createClient(url, key, {
+        auth: { autoRefreshToken: false, persistSession: false },
+    });
+}
+
+function userScopedClient(accessToken: string) {
+    const url = Deno.env.get("SUPABASE_URL");
+    const key = Deno.env.get("SUPABASE_ANON_KEY") ?? Deno.env.get("SUPABASE_PUBLISHABLE_KEY");
+    if (!url || !key) throw new Error("Supabase user-scoped environment is not configured");
+    return createClient(url, key, {
+        global: { headers: { Authorization: `Bearer ${accessToken}` } },
+        auth: { autoRefreshToken: false, persistSession: false },
+    });
+}
+
 const adminBaseUrl = (Deno.env.get("ADMIN_BASE_URL") ?? "https://sportbot-admin.netlify.app").trim();
 
 Deno.serve(async (req) => {
@@ -81,8 +102,19 @@ Deno.serve(async (req) => {
         return json({ error: "Method Not Allowed" }, corsHeaders, 405);
     }
 
-    if (!authorizeRequest(req, Deno.env.get("AGENT_MCP_SECRET"))) {
-        return json({ error: "Unauthorized" }, corsHeaders, 401);
+    const accessToken = extractUserBearer(req);
+    if (!accessToken) return json({ error: "Supabase user JWT required" }, corsHeaders, 401);
+
+    let auditClient: ReturnType<typeof serviceClient>;
+    let identity: StaffIdentity;
+    try {
+        auditClient = serviceClient();
+        identity = await resolveStaffIdentity(userAuthClient(), auditClient, accessToken);
+    } catch (error) {
+        if (error instanceof IdentityError) {
+            return json({ error: error.message }, corsHeaders, error.status);
+        }
+        return json({ error: "No fue posible verificar la identidad" }, corsHeaders, 503);
     }
 
     let payload: unknown;
@@ -98,32 +130,58 @@ Deno.serve(async (req) => {
 
     if (validation.isNotification) return new Response(null, { status: 202, headers: corsHeaders });
 
-    const supabase = serviceClient();
-    const execute = createAgentToolExecutor(supabase, { adminBaseUrl });
+    // All business-tool queries use the authenticated user's JWT and RLS.
+    // service_role remains limited to membership resolution, quota and audit.
+    const userSupabase = userScopedClient(accessToken);
+    const execute = createAgentToolExecutor(userSupabase, {
+        adminBaseUrl,
+        allowedTools: ROLE_TOOL_ALLOWLIST[identity.role],
+    });
+    const requestId = payload && typeof payload === "object" && "id" in payload
+        ? (payload as { id?: string | number | null }).id ?? null
+        : null;
 
     const response = await handleJsonRpc(payload, async (name, args) => {
         const startedAt = Date.now();
+        await assertRateLimit(auditClient, identity.userId);
+        const auditId = await beginToolCall(auditClient, {
+            toolName: name,
+            args,
+            actorUserId: identity.userId,
+            actorRole: identity.role,
+            requestId,
+        });
         try {
-            await assertRateLimit(supabase);
             const result = await execute(name, args);
-            await recordToolCall(supabase, {
-                toolName: name,
-                args,
+            await finishToolCall(auditClient, auditId, {
                 status: "ok",
                 latencyMs: Date.now() - startedAt,
             });
             return result;
         } catch (error) {
-            await recordToolCall(supabase, {
-                toolName: name,
-                args,
+            await finishToolCall(auditClient, auditId, {
                 status: "error",
                 error: error instanceof Error ? error.message : String(error),
                 latencyMs: Date.now() - startedAt,
             });
             throw error;
         }
-    }, { era: validation.era, protocolVersion: validation.protocolVersion });
+    }, {
+        era: validation.era,
+        protocolVersion: validation.protocolVersion,
+        role: identity.role,
+        onDenied: async (name, args) => {
+            await recordToolCall(auditClient, {
+                toolName: name,
+                args: { provided_keys: Object.keys(args).slice(0, 20) },
+                status: "denied",
+                error: "Herramienta no autorizada para el rol actual",
+                actorUserId: identity.userId,
+                actorRole: identity.role,
+                requestId,
+            });
+        },
+    });
 
     if (response === null) {
         return new Response(null, { status: 202, headers: corsHeaders });
