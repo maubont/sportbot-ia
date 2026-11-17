@@ -1,7 +1,7 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "npm:@supabase/supabase-js@2";
-import { getProductMedia, resolveProduct } from "./tools.ts";
+import { getProductMedia } from "./tools.ts";
+import { requireAdmin } from "../_shared/admin_auth.ts";
 
 const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
@@ -12,20 +12,15 @@ serve(async (req) => {
     if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
     try {
-        const supabase = createClient(
-            Deno.env.get("SUPABASE_URL")!,
-            Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-        );
+        const auth = await requireAdmin(req, corsHeaders);
+        if (auth instanceof Response) return auth;
+
+        const { supabase } = auth;
 
         const url = new URL(req.url);
         const query = url.searchParams.get("query") || "jordan";
 
         console.log(`[test_tools v3] Testing getProductMedia with query: ${query}`);
-
-        // Test 1: Resolve Product directly
-        // Note: resolveProduct is not exported? Wait, I need to check if it's exported.
-        // I can't check resolveProduct if it's not exported. 
-        // But getProductMedia uses it internally.
 
         const result = await getProductMedia(supabase, query);
 

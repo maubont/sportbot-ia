@@ -1,6 +1,6 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "npm:@supabase/supabase-js@2";
+import { requireAdmin } from "../_shared/admin_auth.ts";
 
 const corsHeaders = {
     "Access-Control-Allow-Origin": "*",
@@ -13,10 +13,10 @@ serve(async (req) => {
     }
 
     try {
-        const supabase = createClient(
-            Deno.env.get("SUPABASE_URL")!,
-            Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-        );
+        const auth = await requireAdmin(req, corsHeaders);
+        if (auth instanceof Response) return auth;
+
+        const { supabase } = auth;
 
         // 1. Check if table exists by selecting 1 row
         const { data, error } = await supabase.from('product_media').select('*').limit(1);
@@ -34,7 +34,7 @@ serve(async (req) => {
         }
 
         // 2. If table exists but is empty, try to seed a dummy record
-        if (data.length === 0) {
+        if ((data || []).length === 0) {
             console.log("Table exists but empty. Seeding...");
             // Get a product
             const { data: products } = await supabase.from('products').select('id, model').limit(1);
@@ -43,8 +43,9 @@ serve(async (req) => {
                 const product = products[0];
                 const { error: insErr } = await supabase.from('product_media').insert({
                     product_id: product.id,
-                    type: 'image',
+                    media_type: 'image',
                     url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff', // Generic Nike shoe
+                    storage_path: `seed/${product.id}/verify-media.jpg`,
                     is_primary: true
                 });
 

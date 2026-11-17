@@ -78,7 +78,39 @@ export const toolsDefinition = [
     },
 ];
 
-// Helper to resolve string/UUID to Product Record
+function getAvailableStock(variant: { stock?: number; reserved?: number }) {
+    return Math.max((variant.stock || 0) - (variant.reserved || 0), 0);
+}
+
+const searchStopWords = new Set([
+    "el", "la", "los", "las", "un", "una", "de", "del", "en", "para",
+    "me", "mi", "mis", "por", "favor", "quiero", "busco", "buscar", "necesito",
+    "tienes", "tiene", "tenes", "hay", "stock", "disponible", "disponibles",
+    "seguro", "muestra", "muestras", "mostrar", "foto", "fotos", "imagen",
+]);
+
+function getSearchTokens(input = "") {
+    const rawSearch = input.toLowerCase().trim();
+    const tokens = rawSearch
+        .split(/\s+/)
+        .map((word) => word.replace(/[^\p{L}\p{N}]/gu, ""))
+        .filter((word) => word && !searchStopWords.has(word));
+
+    return { rawSearch, tokens, searchTerm: tokens.join(" ") };
+}
+
+function buildPublicPaymentUrl(paymentRef: string) {
+    const configuredBase = Deno.env.get("PAYMENT_REDIRECT_BASE_URL")?.trim();
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")?.replace(/\/$/, "");
+    const baseUrl = configuredBase?.replace(/\/$/, "") || (supabaseUrl ? `${supabaseUrl}/functions/v1/payment_redirect` : "");
+
+    if (!baseUrl) {
+        throw new Error("Falta configurar SUPABASE_URL o PAYMENT_REDIRECT_BASE_URL para generar links de pago");
+    }
+
+    return `${baseUrl}?ref=${encodeURIComponent(paymentRef)}`;
+}
+
 // Helper to resolve string/UUID to Product Record
 export async function resolveProduct(supabase: SupabaseClient, input: string) {
     const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input);
@@ -86,7 +118,7 @@ export async function resolveProduct(supabase: SupabaseClient, input: string) {
 
     const { data: products } = await supabase
         .from("products")
-        .select(`id, brand, model, sku, colorway, price_cents, product_variants(size, stock, id)`)
+        .select(`id, brand, model, sku, colorway, price_cents, product_variants(size, stock, reserved, id)`)
         .eq("active", true);
 
     if (!products) return null;
@@ -95,10 +127,7 @@ export async function resolveProduct(supabase: SupabaseClient, input: string) {
         return products.find(p => p.id === input) || null;
     }
 
-    // Remove common Spanish stop words to improve matching (e.g. "las jordan" -> "jordan")
-    const stopWords = ["el", "la", "los", "las", "un", "una", "de", "del", "en", "para"];
-    const rawSearch = input.toLowerCase().trim();
-    const searchTerm = rawSearch.split(" ").filter(w => !stopWords.includes(w)).join(" ");
+    const { rawSearch, tokens, searchTerm } = getSearchTokens(input);
 
     console.log(`[resolveProduct] Raw: "${rawSearch}" -> Clean: "${searchTerm}"`);
 
@@ -108,14 +137,16 @@ export async function resolveProduct(supabase: SupabaseClient, input: string) {
     for (const p of products) {
         const brandModel = `${p.brand} ${p.model}`.toLowerCase();
         const fullText = `${brandModel} ${p.sku} ${p.colorway || ''}`.toLowerCase();
+        const allTokensMatch = tokens.length > 0 && tokens.every((token) => fullText.includes(token));
         let score = 0;
 
         if (brandModel === searchTerm || p.model.toLowerCase() === searchTerm) score += 50;
         else if (fullText.includes(searchTerm)) score += 20;
+        else if (allTokensMatch) score += 18;
 
         // ONLY add stock consideration if there's at least a partial text match
         if (score > 0) {
-            const totalStock = (p.product_variants || []).reduce((s: number, v: any) => s + (v.stock || 0), 0);
+            const totalStock = (p.product_variants || []).reduce((s: number, v: any) => s + getAvailableStock(v), 0);
             if (totalStock > 0) score += 10;
         }
 
@@ -139,28 +170,50 @@ export async function resolveProduct(supabase: SupabaseClient, input: string) {
 
 export async function searchProducts(supabase: SupabaseClient, query?: string, category?: string) {
     console.log(`[search_products] query=${query}, cat=${category}`);
+    const { tokens, searchTerm } = getSearchTokens(query || "");
+
     let dbQuery = supabase
         .from("products")
         .select(`
             id, brand, model, sku, colorway, price_cents, category,
-            variants:product_variants!inner(size, stock)
+            variants:product_variants!inner(size, stock, reserved)
         `)
-        .eq("active", true)
-        .gt("product_variants.stock", 0);
+        .eq("active", true);
 
-    if (category) dbQuery = dbQuery.ilike("category", category);
-    if (query) dbQuery = dbQuery.or(`model.ilike.%${query}%,brand.ilike.%${query}%,sku.ilike.%${query}%`);
+    if (category) dbQuery = dbQuery.ilike("category", `%${category}%`);
 
     const { data, error } = await dbQuery;
     if (error) return { error: error.message };
 
-    const results = (data || []).map((p: any) => ({
-        id: p.id,
-        name: `${p.brand} ${p.model}`,
-        color: p.colorway,
-        price_cop: p.price_cents / 100,
-        available_sizes: (p.variants || []).map((v: any) => v.size).sort((a: number, b: number) => a - b)
-    }));
+    const results = (data || [])
+        .map((p: any) => {
+            const brandModel = `${p.brand} ${p.model}`.toLowerCase();
+            const fullText = `${brandModel} ${p.sku} ${p.colorway || ""} ${p.category || ""}`.toLowerCase();
+            let score = 0;
+
+            if (!searchTerm) score = 1;
+            else if (brandModel === searchTerm || p.model.toLowerCase() === searchTerm) score = 50;
+            else if (fullText.includes(searchTerm)) score = 25;
+            else if (tokens.every((token) => fullText.includes(token))) score = 20;
+
+            const availableSizes = (p.variants || [])
+                .filter((v: any) => getAvailableStock(v) > 0)
+                .map((v: any) => v.size)
+                .sort((a: number, b: number) => a - b);
+
+            return {
+                id: p.id,
+                name: `${p.brand} ${p.model}`,
+                color: p.colorway,
+                price_cop: p.price_cents / 100,
+                available_sizes: availableSizes,
+                _score: score,
+            };
+        })
+        .filter((p: any) => p._score > 0)
+        .filter((p: any) => p.available_sizes.length > 0);
+
+    results.sort((a: any, b: any) => b._score - a._score);
 
     return { products: results, message: `Encontrados ${results.length} modelos con stock.` };
 }
@@ -171,8 +224,8 @@ export async function checkStock(supabase: SupabaseClient, productId: string, si
 
     const sizeNum = Number(size);
     const variants = p.product_variants || [];
-    const available_sizes = variants.filter((v: any) => v.stock > 0).map((v: any) => v.size).sort();
-    const match = variants.find((v: any) => Number(v.size) === sizeNum && v.stock > 0);
+    const available_sizes = variants.filter((v: any) => getAvailableStock(v) > 0).map((v: any) => v.size).sort();
+    const match = variants.find((v: any) => Number(v.size) === sizeNum && getAvailableStock(v) > 0);
 
     console.log(`[check_stock] ${p.brand} ${p.model} size ${sizeNum} -> ${match ? 'FOUND' : 'NOT FOUND'}`);
 
@@ -181,7 +234,7 @@ export async function checkStock(supabase: SupabaseClient, productId: string, si
             available: true,
             product_name: `${p.brand} ${p.model}`,
             size: sizeNum,
-            stock: match.stock,
+            stock: getAvailableStock(match),
             variant_id: match.id,
             message: ` ✅ Sí hay stock de ${p.brand} ${p.model} en talla ${sizeNum}.`
         };
@@ -199,8 +252,8 @@ export async function getProductMedia(supabase: SupabaseClient, productId: strin
     const p = await resolveProduct(supabase, productId);
     if (!p) return { error: "Producto no encontrado" };
 
-    let q = supabase.from("product_media").select("url, type, is_primary").eq("product_id", p.id);
-    if (type) q = q.eq("type", type);
+    let q = supabase.from("product_media").select("url, media_type, is_primary").eq("product_id", p.id);
+    if (type) q = q.eq("media_type", type);
 
     const { data } = await q;
     return { media: data || [], product_name: `${p.brand} ${p.model}` };
@@ -223,7 +276,7 @@ export async function createOrder(
         if (!p) throw new Error(`Producto ${item.product_id} no encontrado`);
 
         const variant = p.product_variants.find((v: any) => Number(v.size) === Number(item.size));
-        if (!variant || variant.stock < (item.quantity || 1)) {
+        if (!variant || getAvailableStock(variant) < (item.quantity || 1)) {
             return { error: `No hay stock suficiente para ${p.brand} ${p.model} en talla ${item.size}` };
         }
 
@@ -252,6 +305,17 @@ export async function createOrder(
 
     await supabase.from("order_items").insert(orderItems.map(i => ({ ...i, order_id: order.id })));
 
+    for (const item of orderItems) {
+        const { error: stockErr } = await supabase.rpc('reserve_stock', {
+            row_id: item.variant_id,
+            amount: item.qty
+        });
+
+        if (stockErr) {
+            throw stockErr;
+        }
+    }
+
     const { data: settings } = await supabase.from("settings").select("*").single();
 
     // Fallback to env vars if settings are missing/null
@@ -262,11 +326,7 @@ export async function createOrder(
         throw new Error("Faltan credenciales de pago (Wompi Public Key / Integrity Secret)");
     }
 
-    const signature = `${paymentRef}${totalCents}COP${wompiSec}`;
-    const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(signature));
-    const integrity = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
-
-    const checkoutUrl = `https://checkout.wompi.co/p/?public-key=${wompiPub}&currency=COP&amount-in-cents=${totalCents}&reference=${paymentRef}&signature:integrity=${integrity}`;
+    const checkoutUrl = buildPublicPaymentUrl(paymentRef);
 
     return {
         success: true,

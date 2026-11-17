@@ -1,0 +1,87 @@
+{
+  "agent": {
+    "ownership": "exclusive",
+    "entries": {
+      "vera": {
+        "name": "Vera",
+        "workspace": "/home/node/.openclaw/workspace-vera",
+        "identity": { "name": "Vera" },
+        "model": "${OPENAI_MODEL:-gpt-4o-mini}",
+        "tools": {
+          "profile": "messaging",
+          "deny": [
+            "exec",
+            "process",
+            "read",
+            "write",
+            "edit",
+            "apply_patch",
+            "browser",
+            "canvas",
+            "nodes",
+            "gateway",
+            "cron",
+            "sessions_spawn",
+            "sessions_send",
+            "message"
+          ]
+        }
+      }
+    }
+  },
+
+  "bindings": [
+    { "agentId": "vera", "match": { "channel": "telegram", "accountId": "vera" } }
+  ],
+
+  "mcp": {
+    "servers": {
+      "sportbot": {
+        "url": "${OPENCLAW_MCP_SERVER_URL}",
+        "transport": "streamable-http",
+        "enabled": true,
+        "connectionTimeoutMs": 5000,
+        "requestTimeoutMs": 20000,
+        "headers": {
+          "Authorization": "Bearer ${AGENT_MCP_SECRET}"
+        },
+        "toolFilter": {
+          "include": [
+            "get_operations_brief",
+            "list_payment_queue",
+            "get_order",
+            "list_inventory_alerts",
+            "list_logistics_queue",
+            "create_agent_action"
+          ]
+        }
+      }
+    }
+  },
+
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "accounts": {
+        "vera": {
+          "botToken": "${TELEGRAM_VERA_BOT_TOKEN}",
+          "dmPolicy": "allowlist",
+          "allowFrom": ["tg:${TELEGRAM_OWNER_ID}"]
+        }
+      }
+    }
+  },
+
+  "tts": {
+    "auto": "inbound",
+    "mode": "final",
+    "provider": "openai",
+    "providers": {
+      "openai": {
+        "apiKey": "${OPENAI_API_KEY}",
+        "model": "gpt-4o-mini-tts",
+        "voice": "coral",
+        "instructions": "Habla en español colombiano, femenino, cálido y breve. Sin muletillas. Ritmo natural, no locución."
+      }
+    }
+  }

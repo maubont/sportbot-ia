@@ -1,0 +1,54 @@
+# =============================================================================
+# docker-compose.yml — OpenClaw Gateway para Vera en Railway Hobby
+# =============================================================================
+# Variables de entorno: definir en .env o en Railway Dashboard
+#   - AGENT_MCP_SECRET: secreto para autenticar contra el MCP de Supabase
+//   - TELEGRAM_VERA_BOT_TOKEN: token del bot de Telegram (creado en @BotFather)
+//   - OPENAI_API_KEY: clave de OpenAI para STT/TTS y razonamiento
+# =============================================================================
+
+version: "3.8"
+
+services:
+  openclaw-gateway:
+    build:
+      context: ..
+      dockerfile: docker/openclaw/Dockerfile
+    image: sportbot/openclaw-vera:${SOURCE_SHA:-latest}
+    container_name: sportbot-vera-gateway
+    restart: unless-stopped
+    ports:
+      - "18789:18789"
+    environment:
+      - NODE_ENV=production
+      - OPENCLAW_GATEWAY_PORT=18789
+      - OPENCLAW_GATEWAY_HOST=0.0.0.0
+      - OPENCLAW_MODE=agent
+      - OPENCLAW_AGENT_ID=vera
+      - OPENCLAW_WORKSPACE_DIR=/home/node/.openclaw/workspace-vera
+      - OPENCLAW_MCP_SERVER_URL=https://YOUR_SUPABASE_PROJECT_ID.supabase.co/functions/v1/agent_mcp
+      - OPENCLAW_MCP_SECRET=${AGENT_MCP_SECRET}
+      - OPENCLAW_TELEGRAM_BOT_TOKEN=${TELEGRAM_VERA_BOT_TOKEN}
+      - OPENCLAW_TTS_PROVIDER=openai
+      - OPENCLAW_TTS_MODEL=gpt-4o-mini-tts
+      - OPENCLAW_TTS_VOICE=coral
+      - OPENCLAW_TTS_AUTO=inbound
+      - OPENCLAW_LOG_LEVEL=info
+    volumes:
+      - openclaw-state:/home/node/.openclaw
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "node", "-e", "const http=require('http');http.get('http://127.0.0.1:18789/healthz',r=>r.statusCode===200?process.exit(0):process.exit(1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - sportbot-network
+
+volumes:
+  openclaw-state:
+
+networks:
+  sportbot-network:
+    driver: bridge

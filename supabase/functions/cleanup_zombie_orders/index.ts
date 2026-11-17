@@ -9,118 +9,66 @@ const corsHeaders = {
 /**
  * Zombie Order Cleanup Function
  * 
- * Runs on schedule (hourly) to:
- * 1. Find orders stuck in 'awaiting_payment' for more than 24 hours
- * 2. Release reserved stock back to inventory
- * 3. Mark orders as 'expired'
+ * Runs on schedule and delegates all state/stock changes to the transactional
+ * `expire_stale_payment_orders` RPC, which applies the configured payment
+ * window and excludes orders awaiting human receipt review or already paid.
+ * Customer notification belongs to `ops_sweep`; this legacy endpoint does not
+ * send messages.
  */
 serve(async (req) => {
     if (req.method === "OPTIONS") {
         return new Response("ok", { headers: corsHeaders });
     }
+    if (req.method !== "POST") {
+        return new Response(JSON.stringify({ error: "Method not allowed" }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+            status: 405,
+        });
+    }
 
     try {
         const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
         const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-        const supabase = createClient(supabaseUrl, supabaseKey);
+        const cleanupJobSecret = Deno.env.get("CLEANUP_JOB_SECRET");
+        const authHeader = req.headers.get("authorization") || "";
+        const isServiceRole = Boolean(supabaseKey && authHeader === `Bearer ${supabaseKey}`);
+        const isCleanupJob = Boolean(cleanupJobSecret && authHeader === `Bearer ${cleanupJobSecret}`);
 
-        // Configuration
-        const EXPIRY_HOURS = 2; // WhatsApp commerce: quick decisions
-        const expiryThreshold = new Date(Date.now() - EXPIRY_HOURS * 60 * 60 * 1000).toISOString();
-
-        console.log(`[Zombie Cleanup] Starting... Looking for orders older than ${EXPIRY_HOURS}h (before ${expiryThreshold})`);
-
-        // 1. Find zombie orders
-        const { data: zombieOrders, error: findError } = await supabase
-            .from("orders")
-            .select("id, created_at, order_items(variant_id, qty)")
-            .eq("status", "awaiting_payment")
-            .lt("created_at", expiryThreshold);
-
-        if (findError) {
-            throw new Error(`Failed to find zombie orders: ${findError.message}`);
-        }
-
-        if (!zombieOrders || zombieOrders.length === 0) {
-            console.log("[Zombie Cleanup] No zombie orders found. All clean! ✨");
-            return new Response(JSON.stringify({
-                success: true,
-                message: "No zombie orders found",
-                processed: 0
-            }), {
+        if (!supabaseKey || (!isServiceRole && !isCleanupJob)) {
+            return new Response(JSON.stringify({ error: "Unauthorized" }), {
                 headers: { ...corsHeaders, "Content-Type": "application/json" },
-                status: 200,
+                status: 401,
             });
         }
 
-        console.log(`[Zombie Cleanup] Found ${zombieOrders.length} zombie orders to process`);
+        const supabase = createClient(supabaseUrl, supabaseKey);
 
-        let processedCount = 0;
-        let stockReleasedCount = 0;
-        const errors: string[] = [];
+        const body = await req.json().catch(() => ({}));
+        const requestedLimit = Number(body?.limit ?? 50);
+        const safeLimit = Number.isFinite(requestedLimit)
+            ? Math.min(Math.max(Math.trunc(requestedLimit), 1), 200)
+            : 50;
 
-        // 2. Process each zombie order
-        for (const order of zombieOrders) {
-            try {
-                console.log(`[Zombie Cleanup] Processing Order ${order.id}...`);
-
-                // 2a. Release stock for each item
-                for (const item of order.order_items || []) {
-                    const { error: stockError } = await supabase.rpc('increment_stock', {
-                        row_id: item.variant_id,
-                        amount: item.qty
-                    });
-
-                    if (stockError) {
-                        // Fallback: Direct update
-                        const { data: variant } = await supabase
-                            .from("product_variants")
-                            .select("stock")
-                            .eq("id", item.variant_id)
-                            .single();
-
-                        if (variant) {
-                            await supabase
-                                .from("product_variants")
-                                .update({ stock: variant.stock + item.qty })
-                                .eq("id", item.variant_id);
-                        }
-                    }
-
-                    stockReleasedCount += item.qty;
-                }
-
-                // 2b. Mark order as expired
-                const { error: updateError } = await supabase
-                    .from("orders")
-                    .update({
-                        status: "expired",
-                        updated_at: new Date().toISOString()
-                    })
-                    .eq("id", order.id);
-
-                if (updateError) {
-                    throw new Error(`Failed to update order: ${updateError.message}`);
-                }
-
-                processedCount++;
-                console.log(`[Zombie Cleanup] ✅ Order ${order.id} expired, ${stockReleasedCount} units released`);
-
-            } catch (orderErr: any) {
-                errors.push(`Order ${order.id}: ${orderErr.message}`);
-                console.error(`[Zombie Cleanup] ❌ Error processing ${order.id}:`, orderErr);
-            }
+        // La RPC aplica la ventana configurada, verifica recibos/aprobaciones,
+        // bloquea la orden y libera sus reservas en la misma transacción.
+        const { data, error } = await supabase.rpc("expire_stale_payment_orders", {
+            p_limit: safeLimit,
+        });
+        if (error) {
+            console.error("[Zombie Cleanup] Expiration RPC failed", { code: error.code ?? "unknown" });
+            throw new Error("Order cleanup RPC failed");
         }
 
+        const candidates = Array.isArray(data) ? data : [];
         const summary = {
             success: true,
-            message: `Cleaned up ${processedCount} zombie orders`,
-            processed: processedCount,
-            stockReleased: stockReleasedCount,
-            errors: errors.length > 0 ? errors : undefined
+            processed: candidates.filter((order: any) => order.expired_now === true).length,
+            candidates: candidates.length,
+            notificationCandidates: candidates.filter((order: any) => order.should_notify === true).length,
+            stockRelease: "atomic_rpc",
         };
 
-        console.log("[Zombie Cleanup] Completed:", summary);
+        console.log("[Zombie Cleanup] Completed:", JSON.stringify(summary));
 
         return new Response(JSON.stringify(summary), {
             headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -128,10 +76,10 @@ serve(async (req) => {
         });
 
     } catch (err: any) {
-        console.error("[Zombie Cleanup] Fatal Error:", err);
+        console.error("[Zombie Cleanup] Fatal error", { message: err?.message ?? "unknown" });
         return new Response(JSON.stringify({
             success: false,
-            error: err.message
+            error: "cleanup_failed"
         }), {
             headers: { ...corsHeaders, "Content-Type": "application/json" },
             status: 500,

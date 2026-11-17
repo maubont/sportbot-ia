@@ -2,7 +2,7 @@
 create extension if not exists "pgcrypto";
 
 -- Create an admin user directly in the auth.users table
--- Email: admin@sportbot.com
+-- Email: contact@example.test
 -- Password: password123
 
 INSERT INTO auth.users (
@@ -27,7 +27,7 @@ SELECT
     uuid_generate_v4(),
     'authenticated',
     'authenticated',
-    'admin@sportbot.com',
+    'contact@example.test',
     crypt('password123', gen_salt('bf')),
     now(),
     '{"provider":"email","providers":["email"]}',
@@ -39,7 +39,7 @@ SELECT
     '',
     ''
 WHERE NOT EXISTS (
-    SELECT 1 FROM auth.users WHERE email = 'admin@sportbot.com'
+    SELECT 1 FROM auth.users WHERE email = 'contact@example.test'
 );
 
 -- Ensure the identity is also created (required for some auth flows)
@@ -63,7 +63,7 @@ SELECT
     now(),
     now()
 FROM auth.users
-WHERE email = 'admin@sportbot.com'
+WHERE email = 'contact@example.test'
 AND NOT EXISTS (
-    SELECT 1 FROM auth.identities WHERE provider = 'email' AND identity_data->>'email' = 'admin@sportbot.com'
+    SELECT 1 FROM auth.identities WHERE provider = 'email' AND identity_data->>'email' = 'contact@example.test'
 );

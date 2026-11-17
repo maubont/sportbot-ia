@@ -1,6 +1,7 @@
 # Dependencies
 node_modules/
 vendor/
+.pnpm-store/
 
 # Environment variables
 .env
@@ -15,7 +16,7 @@ supabase/functions/**/.env
 Thumbs.db
 
 # IDE
-.vscode/
+
 .idea/
 
 # Build
@@ -23,10 +24,18 @@ dist/
 build/
 coverage/
 
+# Capturas locales de revisión (scripts/capture-page.mjs)
+out/
+
 # Logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+.admin-dev-*.log
+.frontend-*.log
+
+# Local database dumps
+supabase-backup-*.sql
 
 # Development artifacts (debug scripts, temp files)
 debug_*.ts
@@ -35,3 +44,12 @@ verify_*.ts
 *.resolved
 *.resolved.*
 *.metadata.json
+
+# Capturas locales del gateway (pueden traer datos de clientes)
+gateway/webhook-capture.log
+gateway/.env.local
+
+# Lista real de numeros autorizados (datos personales)
+gateway/test-allowlist.txt
+gateway/cleanup-job-secret.txt
+gateway/agent-mcp-secret.txt

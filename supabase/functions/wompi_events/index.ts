@@ -15,14 +15,68 @@ async function sha256Hex(input: string): Promise<string> {
         .join("");
 }
 
+function resolveApprovalTimestamp(tx: Record<string, unknown>): string {
+    const candidates = [tx.finalized_at, tx.created_at];
+
+    for (const candidate of candidates) {
+        if (typeof candidate === "string" && !Number.isNaN(Date.parse(candidate))) {
+            return new Date(candidate).toISOString();
+        }
+    }
+
+    return new Date().toISOString();
+}
+
+function getNumberAtPath(source: Record<string, unknown>, path: string): number | null {
+    let value: unknown = source;
+
+    for (const segment of path.split(".")) {
+        if (!value || typeof value !== "object" || !(segment in value)) return null;
+        value = (value as Record<string, unknown>)[segment];
+    }
+
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
+    return null;
+}
+
+function resolveWompiFeeCents(tx: Record<string, unknown>): number | null {
+    const candidatePaths = [
+        "fee_in_cents",
+        "fees_in_cents",
+        "wompi_fee_in_cents",
+        "merchant_fee_in_cents",
+        "fees.fee_in_cents",
+        "fees.wompi_fee_in_cents",
+        "fees.total_fee_in_cents",
+        "fees.transaction_fee_in_cents",
+        "fees.total_in_cents",
+        "fee.amount_in_cents",
+    ];
+
+    for (const path of candidatePaths) {
+        const value = getNumberAtPath(tx, path);
+        if (value !== null && value >= 0) return Math.round(value);
+    }
+
+    return null;
+}
+
+function formatCopFromCents(cents: number): string {
+    const amount = new Intl.NumberFormat("es-CO", {
+        maximumFractionDigits: 0,
+    }).format(cents / 100);
+
+    return `$${amount}`;
+}
+
 serve(async (req) => {
     if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
     try {
-        const checksum = req.headers.get("x-event-checksum");
-
         const body = await req.json();
         const { event, data } = body;
+        const checksum = req.headers.get("x-event-checksum") || body.signature?.checksum;
 
         console.log(`[Wompi] Event: ${event} (Ref: ${data.transaction?.reference})`);
 
@@ -32,37 +86,45 @@ serve(async (req) => {
         const signature = body.signature;
         const bodyTimestamp = body.timestamp; // CRITICAL: timestamp comes from body, not header
 
-        if (eventSecret && checksum && signature?.properties && bodyTimestamp) {
-            // Build chain from signature.properties
-            let chain = "";
-            for (const prop of signature.properties) {
-                const parts = prop.split(".");
-                let value: any = data;
-                for (const part of parts) {
-                    value = value?.[part];
-                }
-                chain += String(value ?? "");
-            }
-            // Add body timestamp and secret
-            chain += bodyTimestamp + eventSecret;
-
-            const myChecksum = await sha256Hex(chain);
-
-            if (checksum.toLowerCase() !== myChecksum.toLowerCase()) {
-                console.error("CHECKSUM MISMATCH - Rejecting request", {
-                    received: checksum,
-                    calculated: myChecksum,
-                    properties: signature.properties,
-                    bodyTimestamp
-                });
-                return new Response(JSON.stringify({ error: "Invalid integrity" }), { status: 401, headers: corsHeaders });
-            }
-            console.log("[Wompi] ✓ Checksum validated successfully");
-        } else if (eventSecret && checksum && !signature?.properties) {
-            console.warn("[Wompi] Event missing signature.properties - skipping validation");
-        } else {
-            console.warn("[Wompi] Skipping Checksum validation (missing: secret, checksum, or timestamp)");
+        if (!eventSecret) {
+            console.error("[Wompi] WOMPI_EVENT_SECRET is not configured - rejecting request");
+            return new Response(JSON.stringify({ error: "Wompi event secret is not configured" }), { status: 500, headers: corsHeaders });
         }
+
+        if (!checksum || !signature?.properties || !bodyTimestamp) {
+            console.error("[Wompi] Missing signature fields - rejecting request", {
+                hasChecksum: Boolean(checksum),
+                hasProperties: Boolean(signature?.properties),
+                hasTimestamp: Boolean(bodyTimestamp)
+            });
+            return new Response(JSON.stringify({ error: "Missing integrity signature" }), { status: 401, headers: corsHeaders });
+        }
+
+        // Build chain from signature.properties
+        let chain = "";
+        for (const prop of signature.properties) {
+            const parts = prop.split(".");
+            let value: any = data;
+            for (const part of parts) {
+                value = value?.[part];
+            }
+            chain += String(value ?? "");
+        }
+        // Add body timestamp and secret
+        chain += bodyTimestamp + eventSecret;
+
+        const myChecksum = await sha256Hex(chain);
+
+        if (checksum.toLowerCase() !== myChecksum.toLowerCase()) {
+            console.error("CHECKSUM MISMATCH - Rejecting request", {
+                received: checksum,
+                calculated: myChecksum,
+                properties: signature.properties,
+                bodyTimestamp
+            });
+            return new Response(JSON.stringify({ error: "Invalid integrity" }), { status: 401, headers: corsHeaders });
+        }
+        console.log("[Wompi] ✓ Checksum validated successfully");
 
         if (event !== "transaction.updated") {
             return new Response(JSON.stringify({ status: "ignored" }), { headers: corsHeaders });
@@ -76,6 +138,9 @@ serve(async (req) => {
         const tx = data.transaction;
         const ref = tx.reference;
         const status = tx.status;
+        const isApproved = status === "APPROVED";
+        const approvedAt = isApproved ? resolveApprovalTimestamp(tx) : null;
+        const wompiFeeCents = isApproved ? resolveWompiFeeCents(tx) : null;
 
         // 3. Find Order & Customer
         const { data: order, error: orderError } = await supabase
@@ -104,24 +169,88 @@ serve(async (req) => {
                 updated_at: new Date().toISOString()
             }, { onConflict: "reference" });
 
-        if (payError) console.error("Payment sync error:", payError);
+        if (payError) {
+            console.error("Payment sync error:", payError);
+            throw payError;
+        }
+
+        if (approvedAt) {
+            const { error: approvedPaymentError } = await supabase
+                .from("payments")
+                .update({ approved_at: approvedAt })
+                .eq("reference", ref)
+                .is("approved_at", null);
+
+            if (approvedPaymentError) {
+                console.error("Payment approval timestamp sync error:", approvedPaymentError);
+                throw approvedPaymentError;
+            }
+        }
+
+        if (isApproved && wompiFeeCents !== null && wompiFeeCents > 0) {
+            const feeExternalRef = typeof tx.id === "string" && tx.id ? tx.id : ref;
+            const { error: feeError } = await supabase
+                .from("order_variable_costs")
+                .upsert({
+                    order_id: order.id,
+                    cost_type: "payment_fee",
+                    amount_cents: wompiFeeCents,
+                    currency: "COP",
+                    source: "wompi",
+                    external_ref: feeExternalRef,
+                    occurred_at: approvedAt || new Date().toISOString(),
+                    metadata: {
+                        provider: "wompi",
+                        reference: ref,
+                        transaction_id: tx.id ?? null,
+                    },
+                }, { onConflict: "order_id,cost_type,source,external_ref" });
+
+            if (feeError) {
+                console.error("Wompi fee sync error:", feeError);
+                throw feeError;
+            }
+        }
 
         // 5. Update Order Status
-        if (status === "APPROVED" && order.status !== "paid") {
+        if (isApproved && ["paid", "processing", "shipped", "delivered"].includes(order.status)) {
+            const { error: paidAtError } = await supabase
+                .from("orders")
+                .update({ paid_at: approvedAt })
+                .eq("id", order.id)
+                .is("paid_at", null);
+
+            if (paidAtError) {
+                console.error("Error syncing order paid_at:", paidAtError);
+                throw paidAtError;
+            }
+        }
+
+        if (isApproved && !["paid", "processing", "shipped", "delivered"].includes(order.status)) {
+            const { error: commitError } = await supabase.rpc('commit_order_stock', {
+                target_order_id: order.id
+            });
+
+            if (commitError) {
+                console.error("Error committing stock:", commitError);
+                throw commitError;
+            }
+
             const { error: updateError } = await supabase
                 .from("orders")
-                .update({ status: "paid" })
+                .update({ status: "paid", paid_at: approvedAt })
                 .eq("id", order.id);
 
             if (updateError) {
                 console.error("Error updating order status:", updateError);
+                throw updateError;
             }
 
             // Notify Customer via WhatsApp using shared helper
             const toPhone = customer?.phone_e164;
             if (toPhone) {
-                const amountFormatted = new Intl.NumberFormat('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 }).format(order.total_cents / 100);
-                const msg = `✅ *¡Pago confirmado!* \n\nHola ${customer?.name || 'cliente'}, hemos recibido tu pago de ${amountFormatted} para el pedido *#${order.id.slice(0, 8)}*. \n\nEstamos preparando tus 👟 y te avisaremos cuando estén en camino. ¡Gracias por confiar en SportBot! 🚀`;
+                const amountFormatted = formatCopFromCents(Number(order.total_cents || 0));
+                const msg = `✅ *Pago confirmado*\n\nHola ${customer?.name || "cliente"}, recibimos tu pago de ${amountFormatted} para el pedido *#${order.id.slice(0, 8)}*.\n\nYa estamos preparando tus 👟. Te avisaremos cuando estén en camino.`;
 
                 const result = await sendWhatsApp({ to: toPhone, body: msg });
 
@@ -148,36 +277,27 @@ serve(async (req) => {
                 }
             }
         }
-        else if ((status === "DECLINED" || status === "VOIDED" || status === "ERROR") && order.status !== "cancelled") {
+        else if (
+            (status === "DECLINED" || status === "VOIDED" || status === "ERROR") &&
+            !["cancelled", "expired", "paid", "processing", "shipped", "delivered"].includes(order.status)
+        ) {
             console.log(`[Wompi] Payment Failed (${status}). Restocking Order ${order.id}`);
+
+            const { error: releaseError } = await supabase.rpc('release_order_stock', {
+                target_order_id: order.id
+            });
+
+            if (releaseError) {
+                console.error("Error releasing reserved stock:", releaseError);
+                throw releaseError;
+            }
 
             const { error: updateError } = await supabase
                 .from("orders")
                 .update({ status: "cancelled" })
                 .eq("id", order.id);
 
-            if (!updateError) {
-                const { data: items } = await supabase
-                    .from("order_items")
-                    .select("variant_id, qty")
-                    .eq("order_id", order.id);
-
-                if (items) {
-                    for (const item of items) {
-                        const { error: stockErr } = await supabase.rpc('increment_stock', {
-                            row_id: item.variant_id,
-                            amount: item.qty
-                        });
-
-                        if (stockErr) {
-                            const { data: v } = await supabase.from("product_variants").select("stock").eq("id", item.variant_id).single();
-                            if (v) {
-                                await supabase.from("product_variants").update({ stock: v.stock + item.qty }).eq("id", item.variant_id);
-                            }
-                        }
-                    }
-                }
-            }
+            if (updateError) throw updateError;
         }
 
         return new Response(JSON.stringify({ success: true }), {

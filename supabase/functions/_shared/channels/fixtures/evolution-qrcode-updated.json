@@ -1,0 +1,16 @@
+{
+  "event": "qrcode.updated",
+  "instance": "sportbot",
+  "data": {
+    "qrcode": {
+      "instance": "sportbot",
+      "pairingCode": null,
+      "code": "2@gXskW//2BMgzC8OxQqs3NMXymBeW5abr8gLESvF2bq/CUwxNeKOxLzjTKhTz77zmYGBesYI8B7AIsh1IMDrvLOUMDgQwacKWYhE=,4v4aoVbsawig2VbGR9T5YC8s0yqVbzqVp0xmv0FCWTw=,rgK0eTbTFtI72C4FEApgaLwz0l3PJahk3vpJKE1Fqz4=,+VmL/lqM7R5kCCUyFInSlNyKuMv0jxJVWon6tJ9aIt0=",
+      "base64": "<truncado: 12 KB de PNG>"
+    }
+  },
+  "destination": "<redacted>",
+  "date_time": "2026-10-26T02:35:53.295Z",
+  "server_url": "<redacted>",
+  "apikey": "<redacted: llegaba en el webhook>"
+}

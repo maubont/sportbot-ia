@@ -5,6 +5,8 @@
  * Used by: dispatch_order, wompi_events, admin_actions, twilio_inbound_whatsapp
  */
 
+import { toTwilioAddress } from "./channels/phone.ts";
+
 export interface TwilioSendOptions {
     to: string;
     body: string;
@@ -30,6 +32,10 @@ export async function sendWhatsApp(options: TwilioSendOptions): Promise<TwilioSe
     const accountSid = Deno.env.get("TWILIO_ACCOUNT_SID");
     const authToken = Deno.env.get("TWILIO_AUTH_TOKEN");
     const fromNumber = Deno.env.get("TWILIO_WHATSAPP_FROM") || "whatsapp:+14155238886";
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")?.replace(/\/$/, "");
+    const statusCallbackUrl =
+        Deno.env.get("TWILIO_STATUS_CALLBACK_URL") ||
+        (supabaseUrl ? `${supabaseUrl}/functions/v1/twilio_inbound_whatsapp` : "");
 
     if (!accountSid || !authToken) {
         console.error("[Twilio] Missing credentials (TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN)");
@@ -39,10 +45,15 @@ export async function sendWhatsApp(options: TwilioSendOptions): Promise<TwilioSe
     const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
     const basic = btoa(`${accountSid}:${authToken}`);
 
+    // `customers.phone_e164` guarda E.164 canónico (`+57...`); Twilio exige el
+    // prefijo `whatsapp:`. Acepta ambos para no romper llamadas antiguas.
+    const toAddress = to.startsWith("whatsapp:") ? to : (toTwilioAddress(to) ?? to);
+
     const form = new URLSearchParams();
     form.set("From", fromNumber);
-    form.set("To", to);
+    form.set("To", toAddress);
     if (body) form.set("Body", body);
+    if (statusCallbackUrl) form.set("StatusCallback", statusCallbackUrl);
     mediaUrls.forEach((m) => form.append("MediaUrl", m));
 
     // Timeout handling

@@ -1,0 +1,9 @@
+packages:
+  - "frontend"
+  - "admin"
+  - "packages/*"
+
+verifyDepsBeforeRun: false
+
+allowBuilds:
+  esbuild: true

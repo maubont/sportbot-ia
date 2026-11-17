@@ -1,21 +1,23 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { type User, type Session } from "@supabase/supabase-js";
 import { supabase } from "./supabase";
+import { AuthContext } from "./auth-context";
 
-type AuthContextType = {
-    user: User | null;
-    session: Session | null;
-    loading: boolean;
-};
-
-const AuthContext = createContext<AuthContextType>({ user: null, session: null, loading: true });
-
-export const useAuth = () => useContext(AuthContext);
-
-export function AuthProvider({ children }: { children: React.ReactNode }) {
+export function AuthProvider({ children }: { children: ReactNode }) {
     const [user, setUser] = useState<User | null>(null);
     const [session, setSession] = useState<Session | null>(null);
     const [loading, setLoading] = useState(true);
+
+    async function signOut() {
+        const { error } = await supabase.auth.signOut();
+
+        if (error) {
+            throw error;
+        }
+
+        setSession(null);
+        setUser(null);
+    }
 
     useEffect(() => {
         // Optimistic check - don't block render if failing
@@ -35,7 +37,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }, []);
 
     return (
-        <AuthContext.Provider value={{ user, session, loading }}>
+        <AuthContext.Provider value={{ user, session, loading, signOut }}>
             {children}
         </AuthContext.Provider>
     );

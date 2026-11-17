@@ -21,12 +21,25 @@ CREATE TABLE IF NOT EXISTS product_variants (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     product_id UUID REFERENCES products(id) ON DELETE CASCADE,
     size NUMERIC NOT NULL,
-    stock INTEGER NOT NULL DEFAULT 0,
-    reserved INTEGER DEFAULT 0,
+    stock INTEGER NOT NULL DEFAULT 0 CHECK (stock >= 0),
+    reserved INTEGER NOT NULL DEFAULT 0 CHECK (reserved >= 0),
+    created_at TIMESTamptZ DEFAULT NOW(),
+    updated_at TIMESTamptZ DEFAULT NOW(),
+    CONSTRAINT product_variants_reserved_not_above_stock CHECK (reserved <= stock)
+);
+CREATE INDEX idx_variants_product_size ON product_variants(product_id, size);
+CREATE UNIQUE INDEX idx_product_variants_product_size_unique ON product_variants(product_id, size);
+
+-- 2b. PRODUCT COSTS (Admin-only unit economics)
+CREATE TABLE IF NOT EXISTS product_costs (
+    product_id UUID PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
+    default_unit_cost_cents INTEGER NOT NULL DEFAULT 0 CHECK (default_unit_cost_cents >= 0),
+    currency TEXT NOT NULL DEFAULT 'COP',
+    source TEXT NOT NULL DEFAULT 'manual',
+    notes TEXT,
     created_at TIMESTamptZ DEFAULT NOW(),
     updated_at TIMESTamptZ DEFAULT NOW()
 );
-CREATE INDEX idx_variants_product_size ON product_variants(product_id, size);
 
 -- 3. CUSTOMERS
 CREATE TABLE IF NOT EXISTS customers (
@@ -92,6 +105,7 @@ CREATE TABLE IF NOT EXISTS orders (
     subtotal_cents INTEGER NOT NULL DEFAULT 0,
     total_cents INTEGER NOT NULL DEFAULT 0,
     payment_reference TEXT UNIQUE, -- Wompi reference
+    paid_at TIMESTAMPTZ,
     created_at TIMESTamptZ DEFAULT NOW(),
     updated_at TIMESTamptZ DEFAULT NOW()
 );
@@ -104,10 +118,51 @@ CREATE TABLE IF NOT EXISTS order_items (
     variant_id UUID REFERENCES product_variants(id),
     qty INTEGER DEFAULT 1,
     unit_price_cents INTEGER,
+    unit_cost_cents INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTamptZ DEFAULT NOW()
 );
 
--- 9. PAYMENTS
+-- 9. ORDER VARIABLE COSTS
+CREATE TABLE IF NOT EXISTS order_variable_costs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    cost_type TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL CHECK (amount_cents >= 0),
+    currency TEXT NOT NULL DEFAULT 'COP',
+    source TEXT NOT NULL DEFAULT 'manual',
+    external_ref TEXT,
+    occurred_at TIMESTamptZ DEFAULT NOW(),
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTamptZ DEFAULT NOW(),
+    updated_at TIMESTamptZ DEFAULT NOW()
+);
+
+-- 10. ORDER ECONOMICS
+CREATE TABLE IF NOT EXISTS order_economics (
+    order_id UUID PRIMARY KEY REFERENCES orders(id) ON DELETE CASCADE,
+    currency TEXT NOT NULL DEFAULT 'COP',
+    revenue_cents INTEGER NOT NULL DEFAULT 0,
+    subtotal_cents INTEGER NOT NULL DEFAULT 0,
+    shipping_charged_cents INTEGER NOT NULL DEFAULT 0,
+    cogs_cents INTEGER NOT NULL DEFAULT 0,
+    payment_fee_cents INTEGER NOT NULL DEFAULT 0,
+    shipping_real_cost_cents INTEGER NOT NULL DEFAULT 0,
+    packaging_cost_cents INTEGER NOT NULL DEFAULT 0,
+    discount_cents INTEGER NOT NULL DEFAULT 0,
+    twilio_cost_cents INTEGER NOT NULL DEFAULT 0,
+    ai_cost_cents INTEGER NOT NULL DEFAULT 0,
+    other_variable_cost_cents INTEGER NOT NULL DEFAULT 0,
+    variable_cost_cents INTEGER NOT NULL DEFAULT 0,
+    gross_margin_cents INTEGER NOT NULL DEFAULT 0,
+    contribution_margin_cents INTEGER NOT NULL DEFAULT 0,
+    contribution_margin_bps INTEGER NOT NULL DEFAULT 0,
+    data_quality_flags TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    calculated_at TIMESTamptZ DEFAULT NOW(),
+    created_at TIMESTamptZ DEFAULT NOW(),
+    updated_at TIMESTamptZ DEFAULT NOW()
+);
+
+-- 11. PAYMENTS
 CREATE TABLE IF NOT EXISTS payments (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     order_id UUID REFERENCES orders(id) ON DELETE CASCADE,
@@ -115,27 +170,36 @@ CREATE TABLE IF NOT EXISTS payments (
     reference TEXT NOT NULL, -- matches order.payment_reference
     transaction_id TEXT, -- Wompi transaction ID
     status TEXT DEFAULT 'pending', -- pending, approved, declined, voided, error
+    approved_at TIMESTAMPTZ,
     raw_event JSONB,
     created_at TIMESTamptZ DEFAULT NOW(),
     updated_at TIMESTamptZ DEFAULT NOW()
 );
 
--- 10. SETTINGS (Singleton)
+-- 12. SETTINGS (Singleton)
 CREATE TABLE IF NOT EXISTS settings (
     id INTEGER PRIMARY KEY DEFAULT 1,
     store_name TEXT DEFAULT 'SportBot Store',
     timezone TEXT DEFAULT 'America/Bogota',
     welcome_message TEXT DEFAULT 'Hola! Bienvenido a SportBot 👟',
+    system_prompt TEXT,
+    storefront_url TEXT,
+    welcome_image_url TEXT,
+    catalog_pdf_url TEXT,
     llm_provider TEXT DEFAULT 'openai',
     stt_provider TEXT DEFAULT 'openai',
     twilio_whatsapp_number TEXT,
     twilio_status TEXT DEFAULT 'active',
+    fulfillment_sla_hours INTEGER DEFAULT 24,
+    delivery_sla_hours INTEGER DEFAULT 72,
     wompi_public_key TEXT,
     wompi_integrity_secret TEXT,
     wompi_event_secret TEXT,
     created_at TIMESTamptZ DEFAULT NOW(),
     updated_at TIMESTamptZ DEFAULT NOW(),
-    CONSTRAINT match_single_row CHECK (id = 1)
+    CONSTRAINT match_single_row CHECK (id = 1),
+    CONSTRAINT settings_fulfillment_sla_hours_positive CHECK (fulfillment_sla_hours IS NULL OR fulfillment_sla_hours > 0),
+    CONSTRAINT settings_delivery_sla_hours_positive CHECK (delivery_sla_hours IS NULL OR delivery_sla_hours > 0)
 );
 
 -- Insert default settings if not exists
@@ -150,6 +214,9 @@ ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE media_files ENABLE ROW LEVEL SECURITY;
 ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE order_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE product_costs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE order_variable_costs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE order_economics ENABLE ROW LEVEL SECURITY;
 ALTER TABLE payments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE settings ENABLE ROW LEVEL SECURITY;
 
@@ -183,10 +250,19 @@ CREATE POLICY "Admin Full Access Orders" ON orders FOR ALL USING (auth.role() = 
 -- 8. Order Items: Admin Full Access
 CREATE POLICY "Admin Full Access Order Items" ON order_items FOR ALL USING (auth.role() = 'authenticated');
 
--- 9. Payments: Admin Full Access
+-- 9. Product Costs: Admin Full Access
+CREATE POLICY "Admin Full Access Product Costs" ON product_costs FOR ALL USING (auth.role() = 'authenticated');
+
+-- 10. Order Variable Costs: Admin Full Access
+CREATE POLICY "Admin Full Access Order Variable Costs" ON order_variable_costs FOR ALL USING (auth.role() = 'authenticated');
+
+-- 11. Order Economics: Admin Full Access
+CREATE POLICY "Admin Full Access Order Economics" ON order_economics FOR ALL USING (auth.role() = 'authenticated');
+
+-- 12. Payments: Admin Full Access
 CREATE POLICY "Admin Full Access Payments" ON payments FOR ALL USING (auth.role() = 'authenticated');
 
--- 10. Settings: Admin Full Access
+-- 13. Settings: Admin Full Access
 CREATE POLICY "Admin Full Access Settings" ON settings FOR ALL USING (auth.role() = 'authenticated');
 
 -- STORAGE BUCKETS (Script cannot create buckets via SQL directly in all Supabase versions, but usually done via dashboard or client)
